@@ -1,3 +1,13 @@
+# Publishes pi-unified-exec to npm via Trusted Publisher (OIDC).
+# No NPM_TOKEN secret required — authentication is proven by the
+# id-token: write permission below, which GitHub Actions signs and npm
+# validates against the Trusted Publisher config on
+# https://www.npmjs.com/package/pi-unified-exec/access.
+#
+# Release flow:
+#   npm version patch          # bumps package.json + creates v* tag
+#   git push && git push --tags
+
 name: Publish to npm
 
 on:
@@ -42,22 +52,3 @@ jobs:
 
       - name: Publish
         run: npm publish --provenance
-        env:
-          # Bootstrap-then-OIDC pattern.
-          #
-          # Trusted Publisher is a per-package setting on npmjs.com, so it
-          # cannot be configured before the package exists. For the very
-          # first publish, set an `NPM_TOKEN` repository secret to a one-time
-          # npm Automation Token (npmjs.com -> Access Tokens -> Generate New
-          # Token -> Automation). Automation tokens bypass 2FA and are meant
-          # for CI.
-          #
-          # Once v0.1.0 is published:
-          #   1. Configure Trusted Publisher on npmjs.com pointing at this
-          #      workflow file.
-          #   2. Delete the NPM_TOKEN secret from GitHub.
-          #
-          # With NPM_TOKEN unset, NODE_AUTH_TOKEN is empty -> npm falls back
-          # to OIDC trusted publishing via the `id-token: write` permission
-          # above, and provenance attestations are emitted automatically.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
