@@ -1,0 +1,13 @@
+# AGENTS.md
+
+If you want to inspect pi-mono's source code, git clone https://github.com/badlogic/pi-mono to ./local_data/pi-mono
+
+./local_data is added in .gitignore.
+
+## Frontier Models
+
+The following are the frontier models. Prefer to use them as defaults:
+
+- `gpt-5.4`
+- `claude-opus-4-7`
+- `claude-sonnet-4-6`
