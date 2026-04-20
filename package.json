@@ -1,6 +1,6 @@
 {
 	"name": "pi-unified-exec",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi extension: codex-style unified_exec (session-oriented bash with PTY)",
 	"keywords": [
 		"pi-package",
@@ -27,7 +27,9 @@
 		"LICENSE"
 	],
 	"pi": {
-		"extensions": ["./src/index.ts"]
+		"extensions": [
+			"./src/index.ts"
+		]
 	},
 	"publishConfig": {
 		"access": "public"
