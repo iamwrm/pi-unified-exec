@@ -23,7 +23,15 @@
  */
 
 import { randomBytes } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	type ExtensionAPI,
+	type ExtensionContext,
+	formatSize,
+	truncateTail,
+	type TruncationResult,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 import { collectOutputUntilDeadline } from "./collect.ts";
@@ -32,7 +40,6 @@ import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail, type TruncationResult } from "./truncate.ts";
 import { unescapeChars } from "./unescape.ts";
 
 // ---------------- Constants (mirror codex) ----------------

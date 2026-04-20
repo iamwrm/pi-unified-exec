@@ -1,17 +1,30 @@
 {
-	"name": "unified-exec",
-	"private": true,
-	"type": "module",
+	"name": "pi-extension-unified-exec",
+	"version": "0.1.0",
 	"description": "Pi extension: codex-style unified_exec (session-oriented bash with PTY)",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"codex",
+		"unified-exec",
+		"bash",
+		"pty"
+	],
+	"type": "module",
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
-	"dependencies": {},
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "*",
+		"@mariozechner/pi-tui": "*",
+		"@sinclair/typebox": "*"
+	},
 	"optionalDependencies": {
 		"node-pty-prebuilt-multiarch": "0.10.1-pre.5"
 	},
 	"devDependencies": {
 		"@mariozechner/pi-coding-agent": "0.67.68",
+		"@mariozechner/pi-tui": "0.67.68",
 		"@sinclair/typebox": "0.34.48",
 		"@types/node": "^22.0.0",
 		"tsx": "^4.19.0",

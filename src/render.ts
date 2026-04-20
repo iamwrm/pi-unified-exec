@@ -11,12 +11,13 @@
 
 import {
 	type AgentToolResult,
+	DEFAULT_MAX_BYTES,
+	formatSize,
+	type Theme,
 	type ToolRenderResultOptions,
 	truncateToVisualLines,
 } from "@mariozechner/pi-coding-agent";
 import { Container, Text, truncateToWidth, type Component } from "@mariozechner/pi-tui";
-import type { Theme } from "@mariozechner/pi-coding-agent";
-import { DEFAULT_MAX_BYTES, formatSize } from "./truncate.ts";
 
 /**
  * Local re-statement of pi's ToolRenderContext since it isn't re-exported

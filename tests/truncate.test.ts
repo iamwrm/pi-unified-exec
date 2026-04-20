@@ -1,12 +1,14 @@
 /**
- * Unit tests for truncateTail — the port of pi's built-in tail-truncation.
+ * Unit tests for truncateTail — re-exported from `@mariozechner/pi-coding-agent`.
  *
- * Cases mirror pi's own behavior as closely as possible.
+ * These tests pin the behavior we depend on. If pi-coding-agent ever
+ * changes truncation semantics in a way that breaks unified-exec, these
+ * tests will surface it before the LLM does.
  */
 
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "../src/truncate.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "@mariozechner/pi-coding-agent";
 
 describe("truncateTail", () => {
 	it("passes short content through untouched", () => {
