@@ -30,8 +30,7 @@
 		"extensions": ["./src/index.ts"]
 	},
 	"publishConfig": {
-		"access": "public",
-		"provenance": true
+		"access": "public"
 	},
 	"peerDependencies": {
 		"@mariozechner/pi-coding-agent": "*",

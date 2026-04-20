@@ -41,7 +41,7 @@ jobs:
           fi
 
       - name: Publish
-        run: npm publish
+        run: npm publish --provenance
         env:
           # Bootstrap-then-OIDC pattern.
           #
