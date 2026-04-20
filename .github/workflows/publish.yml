@@ -23,7 +23,7 @@ jobs:
       contents: read
       id-token: write          # required for npm OIDC trusted publishing + provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Node 24 ships npm 11.x out of the box, which is required for
       # Trusted Publisher OIDC (introduced in npm 11.5.1, July 2025).
