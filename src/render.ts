@@ -88,12 +88,6 @@ function tildify(path: string): string {
 	return path;
 }
 
-/** Shorten long command strings for a single-line banner. */
-function commandPreview(cmd: string): string {
-	// Collapse newlines so multiline heredocs don't blow up the banner.
-	return cmd.replace(/\s+/g, " ").trim();
-}
-
 // ---------------- renderCall for exec_command ----------------
 
 export function renderExecCommandCall(
@@ -107,7 +101,9 @@ export function renderExecCommandCall(
 		state.endedAt = undefined;
 	}
 
-	const cmd = args?.cmd ? commandPreview(args.cmd) : "...";
+	// Passthrough: match pi's built-in `bash` renderer, which shows the command
+	// verbatim (multi-line heredocs render across multiple rows).
+	const cmd = args?.cmd || "...";
 	const yieldMs = args?.yield_time_ms;
 	const parts: string[] = [];
 	if (yieldMs) parts.push(`yield ${(yieldMs / 1000).toFixed(1)}s`);
