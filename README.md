@@ -1,5 +1,11 @@
 # unified-exec
 
+[![npm version](https://img.shields.io/npm/v/pi-unified-exec.svg?logo=npm&label=npm)](https://www.npmjs.com/package/pi-unified-exec)
+[![npm downloads](https://img.shields.io/npm/dm/pi-unified-exec.svg)](https://www.npmjs.com/package/pi-unified-exec)
+[![License](https://img.shields.io/npm/l/pi-unified-exec.svg)](./LICENSE)
+[![CI](https://github.com/iamwrm/pi-unified-exec/actions/workflows/ci.yml/badge.svg)](https://github.com/iamwrm/pi-unified-exec/actions/workflows/ci.yml)
+[![Publish to npm](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml/badge.svg)](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml)
+
 A pi extension that ports codex's `unified_exec` session model: every bash
 command becomes a long-lived session the LLM drives with short polls, instead
 of a single blocking call the agent waits on.
