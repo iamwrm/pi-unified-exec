@@ -582,17 +582,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "exec_command",
 		label: "exec_command",
-		description: [
-			"Runs a command in a persistent session and returns output after yield_time_ms, along with",
-			"EITHER `session_id` (session still running — follow up with write_stdin) OR `exit_code`",
-			"(session finished). Default yield is 10000ms, clamped to [250, 30000].",
-			"Use tty: true for interactive commands that need a terminal (REPLs, ssh, sudo prompts, TUIs).",
-		].join(" "),
-		promptSnippet: "Run a command in a persistent session (codex-style unified_exec)",
+		description:
+			"Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms.",
+		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
-			"Every exec_command opens a persistent session. If the response contains `session_id` (not `exit_code`), the process is still running — follow up with write_stdin to poll or send input.",
-			"Pick yield_time_ms based on expected duration: ~500ms for quick scripts, 10_000 default, up to 30_000 for commands you expect to finish inline. For dev servers and watchers, rely on the default and use write_stdin to poll later.",
-			"Use `tty: true` for interactive programs that need a terminal (REPLs, ssh, sudo, TUIs). Default `tty: false` is pipe-based and suffices for scripts.",
+			"Prefer grep/find/ls tools over exec_command for file exploration (faster, respects .gitignore).",
+			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
@@ -620,32 +615,20 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "write_stdin",
 		label: "write_stdin",
-		description: [
-			"Writes characters to an existing unified-exec session and returns recent output.",
-			"Empty `chars`/`chars_b64` with yield_time_ms polls without writing.",
-			"`chars` is decoded as a C-style escape string: \\n \\r \\t \\xHH \\uHHHH \\u{H\u2026} \\0 \\a \\e \\b \\f \\v \\\\ \\\" are interpreted;",
-			"unknown escapes (e.g. \\q) pass through literally. For raw binary use `chars_b64` (base64-encoded bytes).",
-			"Default yield 250ms; for empty polls yield is clamped to [5000, 300000].",
-		].join(" "),
-		promptSnippet: "Drive or poll a running unified-exec session",
-		promptGuidelines: [
-			"Empty `chars`/`chars_b64` = poll only. Use to wait for more output from a running session.",
-			"`chars` supports C-style escapes: send `\\x03` for Ctrl-C, `\\x04` for EOF, `\\x1b` for ESC, `\\n` for newline. Unknown escapes (`\\q`, `\\.`, etc.) pass through literally. Use `\\\\` for a literal backslash.",
-			"For arbitrary binary input use `chars_b64` instead (base64-encoded bytes). Mutually exclusive with `chars`.",
-			"If the response contains `exit_code`, the session has ended and its session_id is no longer valid.",
-		],
+		description:
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary.",
+		promptSnippet: "Send input to or poll a running session",
 		parameters: Type.Object({
-			session_id: Type.Number({ description: "Identifier of the running session (from exec_command)." }),
+			session_id: Type.Number({ description: "Session id from exec_command." }),
 			chars: Type.Optional(
 				Type.String({
 					description:
-						"C-style escape string to write to stdin. Supports \\n \\r \\t \\xHH \\uHHHH \\u{H\u2026} \\0 \\a \\e \\b \\f \\v \\\\ \\\". Unknown \\X pass through literally. Empty = pure poll. Mutually exclusive with chars_b64.",
+						"Text with C-style escapes: \\xHH, \\uHHHH, \\u{H\u2026}, \\n \\r \\t \\0 \\a \\e \\b \\f \\v \\\\ \\\". Unknown \\X preserved literally. Mutually exclusive with chars_b64.",
 				}),
 			),
 			chars_b64: Type.Optional(
 				Type.String({
-					description:
-						"Base64-encoded bytes to write to stdin. Use for arbitrary binary or exact byte control. Mutually exclusive with chars.",
+					description: "Raw bytes (base64) to write. Mutually exclusive with chars.",
 				}),
 			),
 			yield_time_ms: Type.Optional(
@@ -669,12 +652,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "kill_session",
 		label: "kill_session",
-		description: "Terminate a live unified-exec session. Sends SIGTERM; escalates to SIGKILL after 2s if still alive.",
-		promptSnippet: "Terminate a unified-exec session",
-		promptGuidelines: [
-			"Use to force-stop a runaway session the process won't exit via Ctrl-C (`write_stdin` with chars='\\x03').",
-			"After kill_session, the session_id is invalid. Don't reuse it.",
-		],
+		description:
+			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s). Use when the process won't exit via Ctrl-C. session_id is invalid after.",
+		promptSnippet: "Terminate a session",
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session to terminate." }),
 			signal: Type.Optional(
@@ -742,10 +722,7 @@ export default function (pi: ExtensionAPI) {
 		name: "list_sessions",
 		label: "list_sessions",
 		description: "List all live unified-exec sessions in this pi run.",
-		promptSnippet: "Enumerate live unified-exec sessions",
-		promptGuidelines: [
-			"Use if you lost track of a session_id, or to audit what's running before starting new work.",
-		],
+		promptSnippet: "List live sessions",
 		parameters: Type.Object({}),
 		async execute() {
 			// Reap any sessions that have exited silently (e.g., completed between
