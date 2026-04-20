@@ -1,5 +1,5 @@
 {
-	"name": "pi-extension-unified-exec",
+	"name": "pi-unified-exec",
 	"version": "0.1.0",
 	"description": "Pi extension: codex-style unified_exec (session-oriented bash with PTY)",
 	"keywords": [
@@ -10,9 +10,28 @@
 		"bash",
 		"pty"
 	],
+	"license": "MIT",
+	"author": "Ren Wang <iamwrm@gmail.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/iamwrm/pi-unified-exec.git"
+	},
+	"bugs": {
+		"url": "https://github.com/iamwrm/pi-unified-exec/issues"
+	},
+	"homepage": "https://github.com/iamwrm/pi-unified-exec#readme",
 	"type": "module",
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
 	"pi": {
 		"extensions": ["./src/index.ts"]
+	},
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
 	},
 	"peerDependencies": {
 		"@mariozechner/pi-coding-agent": "*",
