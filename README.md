@@ -29,15 +29,31 @@ preserved.
 
 ## Install
 
-The extension is auto-discovered from `.pi/extensions/`:
+Published on npm as [`pi-unified-exec`](https://www.npmjs.com/package/pi-unified-exec).
+Install via pi's package manager:
 
 ```bash
-cd .pi/extensions/unified-exec && npm install
+pi install npm:pi-unified-exec            # global (~/.pi/agent/settings.json)
+pi install -l npm:pi-unified-exec         # project-local (.pi/settings.json)
 ```
 
-`npm install` fetches `node-pty-prebuilt-multiarch` (prebuilt binaries — no
-compilation). If the install fails on your platform, pipe mode (`tty: false`)
-still works, but PTY mode (`tty: true`) will error with a clear message.
+`pi install` runs `npm install` under the hood, which fetches
+`node-pty-prebuilt-multiarch` (prebuilt binaries — no compilation). If the
+install fails on your platform, pipe mode (`tty: false`) still works, but PTY
+mode (`tty: true`) will error with a clear message.
+
+To try without installing:
+
+```bash
+pi -e npm:pi-unified-exec
+```
+
+Or clone this repo directly into pi's auto-discovery path:
+
+```bash
+git clone https://github.com/iamwrm/pi-unified-exec .pi/extensions/unified-exec
+cd .pi/extensions/unified-exec && npm install
+```
 
 Reload a running pi with `/reload`.
 
@@ -62,8 +78,8 @@ Response body (short output, no truncation):
 session_id: 1                       (mutually exclusive with exit_code)
 exit_code: 0                        (mutually exclusive with session_id)
 signal: SIGTERM                     (optional, if killed)
-log_path: /tmp/pi-unified-exec-1-abc123.log
-cwd: /home/wr/gh/ai_tb
+log_path: /tmp/pi-unified-exec-1-5cc5e104.log
+cwd: /home/you/project
 wall_time_seconds: 0.502
 chunk_id: a4f2c1
 original_token_count: 37
@@ -77,7 +93,7 @@ When output exceeds the caps (50 KiB / 2000 lines), a footer is appended:
 ```
 ...tail of output...
 
-[Showing lines 3900-4120 of 4500 (50.0KB limit). Full output: /tmp/pi-unified-exec-1-abc123.log]
+[Showing lines 3900-4120 of 4500 (50.0KB limit). Full output: /tmp/pi-unified-exec-1-5cc5e104.log]
 ```
 
 ### `write_stdin`
@@ -161,7 +177,7 @@ styling and add session-aware details:
 
 **While streaming (live, updates every second):**
 ```
-$ for i in 1..12; do echo round $i; sleep 0.5; done (yield 2.5s · cwd: ~/gh/ai_tb)
+$ for i in {1..12}; do echo round $i; sleep 0.5; done (yield 2.5s · cwd: ~/project)
 … 1 earlier lines
   round 2
   round 3
@@ -315,8 +331,10 @@ root
 
 ## Tests
 
+From the repo root:
+
 ```bash
-cd .pi/extensions/unified-exec
+npm install
 npx tsx --test tests/*.test.ts
 ```
 

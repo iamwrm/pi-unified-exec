@@ -9,14 +9,31 @@ and tool reference, see [../README.md](../README.md).
   imports via [tsx](https://github.com/privatenumber/tsx)).
 - **Linux or macOS.** Windows PTY (conpty) is not wired up; pipes mode
   (`tty: false`) would work but hasn't been tested.
-- **pi** installed and runnable (`pi --version`). Any project with
-  `.pi/extensions/unified-exec/` will auto-discover this extension.
+- **pi** installed and runnable (`pi --version`). End users install with
+  `pi install npm:pi-unified-exec`; for development you want a local clone
+  of this repo (see below).
 
 ## First-time setup
 
+Clone the repo and install dev dependencies:
+
 ```bash
-cd .pi/extensions/unified-exec
+git clone https://github.com/iamwrm/pi-unified-exec
+cd pi-unified-exec
 npm install
+```
+
+To have pi load your working copy for interactive testing, either symlink it
+into pi's auto-discovery path:
+
+```bash
+ln -s "$PWD" .pi/extensions/unified-exec      # from the project you want it in
+```
+
+or install directly from the local path (writes into pi's settings):
+
+```bash
+pi install -l ./path/to/pi-unified-exec
 ```
 
 `npm install` fetches `node-pty-prebuilt-multiarch` prebuilds. If your
