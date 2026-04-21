@@ -239,8 +239,9 @@ as appropriate for semver.
 5. `npm publish --provenance` — publishes the tarball.
 
 Tarball contents are controlled by `files` in `package.json`:
-`src/`, `README.md`, `LICENSE`. Tests, `local_data/`, `tsconfig.json`,
-`.github/`, `AGENTS.md` are all excluded. Verify with
+`src/`, `README.md`, `LICENSE`. Everything else — `tests/`, `docs/`,
+`local_data/`, `tsconfig.json`, `package-lock.json`, `.github/`,
+`AGENTS.md`, `Changelog.md` — is excluded. Verify with
 `npm pack --dry-run`.
 
 ### Troubleshooting
@@ -249,9 +250,9 @@ Tarball contents are controlled by `files` in `package.json`:
   `v` (trigger is `tags: ["v*"]`). `v0.1.1` ✓, `0.1.1` ✗,
   `release-0.1.1` ✗.
 - **Publish failed, tag is now "wasted"**: fix-forward with another
-  `npm version patch && git push --tags` is usually simplest. To
-  recycle the same version: `git tag -d v0.1.1 && git push origin
-  :refs/tags/v0.1.1`, fix, retag, push.
+  `npm version patch && git push && git push --tags` is usually
+  simplest. To recycle the same version: `git tag -d v0.1.1 && git
+  push origin :refs/tags/v0.1.1`, fix, retag, push.
 - **OIDC auth error** (e.g. `Unable to authenticate, your
   authentication token seems to be invalid`): verify the Trusted
   Publisher config on npmjs.com matches exactly:
