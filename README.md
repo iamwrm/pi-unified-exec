@@ -13,6 +13,25 @@ of a single blocking call the agent waits on.
 Mirrors codex's `exec_command` + `write_stdin` tool surface, with small
 pi-flavor additions (`kill_session`, `list_sessions`).
 
+## Highlights
+
+- **Session-oriented, two-way I/O.** `exec_command` opens a long-lived
+  session; the LLM keeps the `session_id` and drives the same process
+  across turns by interleaving `write_stdin` writes and polls. Every
+  byte the child prints is mirrored to an on-disk log file in parallel
+  with the in-memory buffer, so the full history is recoverable via
+  `read(log_path)` even after the LLM-visible tail truncates.
+- **Bounded waits — the agent never stalls.** Every tool call returns
+  within a hard ceiling: 30 s for `exec_command` and `write_stdin`,
+  5 min for pure background polls. A long-running process keeps
+  running; the agent just gets control back with a `session_id` and
+  can poll again when it chooses.
+- **Ctrl-C and other control bytes, not just stdin text.**
+  `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
+  `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
+  stuck command or drive an interactive TUI — `chars_b64` covers the
+  arbitrary-binary case.
+
 ## Why
 
 Pi's built-in `bash` tool blocks until the process exits. For a dev server,
