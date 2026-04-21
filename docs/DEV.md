@@ -212,6 +212,131 @@ won't affect tests. Verify via the tmux recipe above.
 - **Pi's `/reload` output** echoes the extensions it loaded — check
   that `unified-exec` (or `src/index.ts` under it) is listed.
 
+## Checking upstream compatibility
+
+Every time `@mariozechner/pi-coding-agent` (the host "pi" CLI) cuts a
+release, our extension might break silently. The 6-step recipe below
+turns a version bump into a 5-minute audit instead of a "why did my
+tools stop rendering" debugging session. Record the result in
+[`Changelog.md`](../Changelog.md) so the next person doesn't redo the
+work.
+
+### 1. Read the upstream changelog
+
+Source of truth:
+[`packages/coding-agent/CHANGELOG.md`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md).
+
+Fetch it and stop at the version we're pinned to so you only see
+entries that are newer than ours:
+
+```bash
+CURRENT=$(npm pkg get devDependencies.'@mariozechner/pi-coding-agent' | tr -d '"')
+echo "pinned to $CURRENT"
+
+curl -sL https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/CHANGELOG.md \
+  | awk -v v="$CURRENT" '/^## \[/ { if (index($0, "[" v "]")) exit } { print }'
+```
+
+For each release entry, focus on three kinds of items:
+
+- **Breaking Changes** — must be read in full; assume they affect us
+  until step 2 proves otherwise.
+- **Removed** / **Changed** entries mentioning named exports, event
+  shapes, or `ExtensionAPI` / `ExtensionContext` methods.
+- **Added** entries touching the same surface — safe to skip at first,
+  but worth knowing when we later want to adopt them (new hook
+  arguments, new `ctx.ui` primitives, etc.).
+
+Ignore everything about the TUI chrome, OAuth providers, RPC protocol,
+`models.json`, custom themes, `/slash` commands, skills, subagents,
+compaction, hooks, and HTML export — we don't use any of them.
+
+### 2. Cross-check against our import surface
+
+Confirm what we actually consume:
+
+```bash
+grep -rh 'from "@mariozechner/pi-coding-agent' src/ | sort -u
+```
+
+As of 2026-04-21 the surface is:
+
+- **Types**: `ExtensionAPI`, `ExtensionContext`, `AgentToolResult`,
+  `ToolRenderResultOptions`, `Theme`, `TruncationResult`
+- **Helpers**: `formatSize`, `truncateTail`, `truncateToVisualLines`
+- **Constants**: `DEFAULT_MAX_BYTES`, `DEFAULT_MAX_LINES`
+- **`ExtensionAPI` methods**: `on("session_start" | "session_shutdown")`,
+  `registerFlag`, `getFlag`, `registerTool`, `getActiveTools`,
+  `setActiveTools`
+- **`ExtensionContext` fields** (via the `ctx` / `eventCtx` argument):
+  `ui.notify`, `cwd`, `hasUI`
+
+If an upstream changelog entry mentions **none** of the symbols above,
+it cannot affect us. If it mentions one, read it carefully and run
+step 3 to confirm.
+
+### 3. Probe the installed `.d.ts`
+
+The surest test is to bump locally and let TypeScript tell us:
+
+```bash
+npm install --save-dev @mariozechner/pi-coding-agent@<new-version> \
+                         @mariozechner/pi-tui@<new-version>
+npx tsc --noEmit
+```
+
+A clean typecheck means the API surface we import is unchanged. If it
+errors, grep the installed declarations to find the new shape:
+
+```bash
+grep -rn 'getActiveTools\|setActiveTools\|SessionShutdownEvent' \
+  node_modules/@mariozechner/pi-coding-agent/dist/core/extensions/types.d.ts
+```
+
+### 4. Run the full test suite
+
+```bash
+npx tsx --test tests/*.test.ts
+```
+
+`tests/e2e.test.ts` stubs `ExtensionAPI` ourselves, so a clean
+typecheck plus passing tests is strong evidence of compatibility. For
+TUI-rendering changes (rare), additionally sanity-check via the tmux
+recipe in [Dev loop → Live testing via tmux](#live-testing-via-tmux-no-llm-in-the-loop).
+
+### 5. Record the result in `Changelog.md`
+
+Add an entry under today's date even when nothing had to change:
+
+```markdown
+## YYYY-MM-DD
+
+### Verified
+
+- **Upstream compatibility with `@mariozechner/pi-coding-agent` X.Y.Z**:
+  <one sentence summary of what changed upstream and why it doesn't
+  affect us, or what we had to change if it did>.
+```
+
+This is the audit trail — without it the next upgrade starts from
+zero.
+
+### 6. Bump the pin
+
+If steps 1–4 pass, bump both dev pins in `package.json` and commit:
+
+```bash
+npm install --save-dev @mariozechner/pi-coding-agent@<new-version> \
+                         @mariozechner/pi-tui@<new-version>
+npx tsc --noEmit && npx tsx --test tests/*.test.ts
+git add package.json package-lock.json Changelog.md
+git commit -m "unified-exec: verify compat with pi-coding-agent <new-version>"
+```
+
+`peerDependencies` stays at `"*"` — end users pick up whatever pi
+version they already have installed; the dev pins only govern what we
+typecheck and test against.
+
 ## Releasing to npm
 
 Every `v*` tag push publishes to

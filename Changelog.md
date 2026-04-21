@@ -2,6 +2,33 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-04-21
+
+### Verified
+
+- **Upstream compatibility with `@mariozechner/pi-coding-agent` 0.68.0**:
+  audited the upstream 0.68.0 `CHANGELOG.md` against our extension's
+  usage of pi-coding-agent. All 0.68.0 breaking changes
+  (`createAgentSession({ tools })` now takes `string[]` instead of
+  `Tool[]`; removal of prebuilt cwd-bound tool exports such as
+  `readTool`, `bashTool`, `editTool`, `writeTool`, `grepTool`,
+  `findTool`, `lsTool`, `readOnlyTools`, `codingTools`, and the
+  corresponding `*ToolDefinition` values; removal of ambient
+  `process.cwd()` fallbacks from `DefaultResourceLoader`,
+  `loadProjectContextFiles()`, and `loadSkills()`) target APIs we do
+  **not** call. The types, helpers, constants, and `ExtensionAPI`
+  surface we import (`ExtensionAPI`, `ExtensionContext`,
+  `AgentToolResult`, `ToolRenderResultOptions`, `Theme`,
+  `TruncationResult`, `formatSize`, `truncateTail`,
+  `truncateToVisualLines`, `DEFAULT_MAX_BYTES`, `DEFAULT_MAX_LINES`,
+  `pi.on`, `pi.registerFlag`, `pi.getFlag`, `pi.registerTool`,
+  `pi.getActiveTools`, `pi.setActiveTools`) are unchanged. The new
+  additive fields on `SessionShutdownEvent` (`reason`,
+  `targetSessionFile`) do not affect our handler. No extension code
+  changes required; the devDep pin can be bumped at leisure. See
+  [docs/DEV.md#checking-upstream-compatibility](docs/DEV.md#checking-upstream-compatibility)
+  for the recipe used.
+
 ## 2026-04-20
 
 ### Changed
