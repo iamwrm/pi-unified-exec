@@ -13,6 +13,11 @@ of a single blocking call the agent waits on.
 Mirrors codex's `exec_command` + `write_stdin` tool surface, with small
 pi-flavor additions (`kill_session`, `list_sessions`).
 
+> **Install:**
+> ```bash
+> pi install npm:pi-unified-exec
+> ```
+
 ## Highlights
 
 - **Session-oriented, two-way I/O.** `exec_command` opens a long-lived
@@ -65,13 +70,6 @@ To try without installing:
 
 ```bash
 pi -e npm:pi-unified-exec
-```
-
-Or clone this repo directly into pi's auto-discovery path:
-
-```bash
-git clone https://github.com/iamwrm/pi-unified-exec .pi/extensions/unified-exec
-cd .pi/extensions/unified-exec && npm install
 ```
 
 Reload a running pi with `/reload`.
