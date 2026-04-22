@@ -1,6 +1,6 @@
 {
 	"name": "pi-unified-exec",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Codex-style unified_exec for pi: long-lived shell sessions the LLM polls and drives with write_stdin (Ctrl-C, arrow keys, PTY, REPLs, ssh, dev servers). Full output logged to disk.",
 	"keywords": [
 		"pi-package",
