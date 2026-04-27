@@ -2,6 +2,14 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-04-27 — 0.3.1
+
+### Fixed
+
+- **macOS CI short-command drain race**: increased the bounded trailing-output
+  drain window for very fast commands so stdout/stderr that arrives shortly
+  after the process exit event is captured reliably on macOS Node 22.
+
 ## 2026-04-27 — 0.3.0
 
 ### Added

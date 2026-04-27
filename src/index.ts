@@ -268,7 +268,9 @@ async function runExecCommand(
 			outputNotify: session.outputNotify,
 			outputClosed: session.outputClosed,
 			exited: session.exited,
-			deadlineMs: Date.now() + 50,
+			// macOS can deliver stdout/stderr shortly after the exit event for very
+			// fast commands. Give the trailing drain a bounded but less brittle window.
+			deadlineMs: Date.now() + 500,
 			externalAbort: signal,
 		});
 		ctx.store.releaseId(id);
