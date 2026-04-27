@@ -2,7 +2,20 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
-## 2026-04-27
+## 2026-04-27 — 0.3.0
+
+### Added
+
+- **Running-session UI after `/tree`**: while unified-exec processes are still
+  alive, the extension now keeps a TUI footer status. After `/tree` navigation
+  it also shows a widget listing live session IDs and commands so humans can
+  see that processes survived branch navigation. The footer/widget now refresh
+  immediately when a background session exits, without waiting for the next
+  tool call or turn.
+- **Contributor guidance**: added `AGENTS.md` guidance requiring changelog
+  updates alongside future code, docs, tests, or package metadata edits.
+
+## 2026-04-27 — 0.2.2
 
 ### Changed
 

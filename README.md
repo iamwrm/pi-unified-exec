@@ -221,6 +221,13 @@ $ for i in {1..12}; do echo round $i; sleep 0.5; done (yield 2.5s · cwd: ~/proj
 » ^C → session_id=1 (yield 1.0s)                  # control byte
 ```
 
+**Running-session UI:** while any unified-exec process is still alive, the TUI
+footer shows `unified-exec: N sessions running`. After `/tree` navigation, a
+widget above the editor lists the live `session_id`s and commands so the human
+sees that processes survived branch navigation. The footer/widget refreshes as
+soon as a background session exits; the exited session remains drainable via
+`write_stdin` until observed, preserving the usual lazy cleanup semantics.
+
 By design this display omits some metadata the LLM sees (chunk_id,
 original_token_count, full log path if tildified) — use `Ctrl+O` on the tool
 row to expand the full captured output.
@@ -414,6 +421,10 @@ completion and never revisit the log, it'll linger until your next reboot.
 - `write_stdin` also works in pipe mode (`tty: false`), not just PTY.
   Useful for feeding lines to `jq`, `sort`, etc.
 - Streaming `onUpdate` tail window for TUI rendering during yields.
+- Running-session UI: footer status while processes are alive and a
+  post-`/tree` widget so humans can see that processes survived branch
+  navigation. The UI refreshes immediately on background session exit without
+  pruning the exited session before the next `write_stdin`/`list_sessions`.
 - Rich `renderCall` / `renderResult` mirroring pi bash's styling: command
   banner with `(yield Ns · cwd: …)` suffix, 5-line collapsed preview with
   `ctrl+o` expand, live "elapsed" counter, `yielded`/`took`/`exit_code`

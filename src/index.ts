@@ -56,6 +56,7 @@ const MAX_SESSIONS = 64;
 const WARNING_SESSIONS = 60;
 const LRU_PROTECTED_COUNT = 8;
 const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence
+const SESSION_UI_KEY = "unified-exec.sessions";
 
 // ---------------- Helpers ----------------
 
@@ -155,6 +156,8 @@ function renderResponseText(shape: ResponseShape): string {
 interface ExtensionCtx {
 	store: SessionStore;
 	ui: ExtensionContext["ui"] | undefined;
+	widgetVisible: boolean;
+	exitUnsubscribers: Map<number, () => void>;
 }
 
 type ExecCommandArgs = {
@@ -288,7 +291,9 @@ async function runExecCommand(
 	// Live session: register it BEFORE we keep polling, so an early abort
 	// doesn't let the session be GC'd / lose its place.
 	const { pruned, count } = ctx.store.insert(session);
+	watchSessionExit(ctx, session);
 	if (pruned) {
+		unwatchSessionExit(ctx, pruned.id);
 		ctx.ui?.notify(`unified-exec: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
 	}
 	if (count >= WARNING_SESSIONS) {
@@ -332,7 +337,7 @@ async function runExecCommand(
 		});
 	}
 	// Process exited during this call → respond with exit info, not a session_id.
-	ctx.store.remove(session.id);
+	removeSession(ctx, session.id);
 	return finalizeResponse({
 		wallTimeSec: wallSec,
 		collected,
@@ -377,7 +382,7 @@ async function runWriteStdin(
 				deadlineMs: Date.now() + 50,
 				externalAbort: signal,
 			});
-			ctx.store.remove(session.id);
+			removeSession(ctx, session.id);
 			const wallSec = (Date.now() - start) / 1000;
 			return finalizeResponse({
 				wallTimeSec: wallSec,
@@ -411,7 +416,7 @@ async function runWriteStdin(
 	const wallSec = (Date.now() - start) / 1000;
 
 	if (session.hasExited) {
-		ctx.store.remove(session.id);
+		removeSession(ctx, session.id);
 		return finalizeResponse({
 			wallTimeSec: wallSec,
 			collected,
@@ -479,6 +484,107 @@ function finalizeResponse(input: FinalizeInput): ResponseShape {
 	return shape;
 }
 
+function runningSessions(ctx: ExtensionCtx): ExecSession[] {
+	return ctx.store
+		.values()
+		.filter((s) => !s.hasExited)
+		.sort((a, b) => a.id - b.id);
+}
+
+function plural(n: number, singular: string, pluralForm = `${singular}s`): string {
+	return n === 1 ? singular : pluralForm;
+}
+
+function formatElapsed(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const totalMinutes = Math.floor(totalSeconds / 60);
+	if (totalMinutes < 60) return `${totalMinutes}m${String(totalSeconds % 60).padStart(2, "0")}s`;
+	const hours = Math.floor(totalMinutes / 60);
+	return `${hours}h${String(totalMinutes % 60).padStart(2, "0")}m`;
+}
+
+function oneLineCommand(command: string, max = 120): string {
+	const oneLine = command.replace(/\s+/g, " ").trim();
+	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
+}
+
+function formatRunningSessionsWidget(sessions: ExecSession[]): string[] {
+	const now = Date.now();
+	const shown = sessions.slice(0, 5);
+	const lines = [
+		`⚠ unified-exec: ${sessions.length} ${plural(sessions.length, "session")} still running`,
+		...shown.map(
+			(s) =>
+				`  #${s.id} ${formatElapsed(now - s.startedAt)} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`,
+		),
+	];
+	if (sessions.length > shown.length) lines.push(`  … ${sessions.length - shown.length} more; use list_sessions`);
+	lines.push("  Use list_sessions for a fresh inventory, write_stdin to poll/drive, or kill_session to stop.");
+	return lines;
+}
+
+function updateRunningSessionsUi(ctx: ExtensionCtx, opts: { showWidget?: boolean; notifyTree?: boolean } = {}): void {
+	const ui = ctx.ui;
+	if (!ui) return;
+	const sessions = runningSessions(ctx);
+	const status = sessions.length ? `unified-exec: ${sessions.length} ${plural(sessions.length, "session")} running` : undefined;
+	ui.setStatus(SESSION_UI_KEY, status);
+
+	if (opts.notifyTree && sessions.length > 0) {
+		ui.notify(
+			`unified-exec: ${sessions.length} ${plural(sessions.length, "session")} still running after /tree.`,
+			"warning",
+		);
+	}
+
+	const setWidget = (ui as any).setWidget as
+		| ((key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void)
+		| undefined;
+	if (!setWidget) return;
+
+	if (sessions.length === 0) {
+		if (ctx.widgetVisible) {
+			setWidget.call(ui, SESSION_UI_KEY, undefined);
+			ctx.widgetVisible = false;
+		}
+		return;
+	}
+
+	if (opts.showWidget || ctx.widgetVisible) {
+		setWidget.call(ui, SESSION_UI_KEY, formatRunningSessionsWidget(sessions), { placement: "aboveEditor" });
+		ctx.widgetVisible = true;
+	}
+}
+
+function watchSessionExit(ctx: ExtensionCtx, session: ExecSession): void {
+	ctx.exitUnsubscribers.get(session.id)?.();
+	const unsubscribe = session.onExit(() => {
+		// Preserve lazy-drain semantics: an exited session stays in the store until
+		// write_stdin/list_sessions/kill_session observes it. The UI only reflects
+		// currently running processes.
+		updateRunningSessionsUi(ctx);
+	});
+	ctx.exitUnsubscribers.set(session.id, unsubscribe);
+}
+
+function unwatchSessionExit(ctx: ExtensionCtx, id: number): void {
+	ctx.exitUnsubscribers.get(id)?.();
+	ctx.exitUnsubscribers.delete(id);
+}
+
+function removeSession(ctx: ExtensionCtx, id: number): ExecSession | undefined {
+	unwatchSessionExit(ctx, id);
+	return ctx.store.remove(id);
+}
+
+function clearSessionExitWatchers(ctx: ExtensionCtx): void {
+	for (const unsubscribe of ctx.exitUnsubscribers.values()) {
+		unsubscribe();
+	}
+	ctx.exitUnsubscribers.clear();
+}
+
 function startStreaming(
 	session: ExecSession,
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
@@ -537,6 +643,8 @@ export default function (pi: ExtensionAPI) {
 			},
 		}),
 		ui: undefined,
+		widgetVisible: false,
+		exitUnsubscribers: new Map(),
 	};
 
 	// By default, unified-exec removes pi's built-in `bash` tool so the LLM
@@ -550,6 +658,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx.ui = eventCtx.ui;
+		updateRunningSessionsUi(ctx);
 		// Default behavior is to remove the built-in `bash` tool. Only keep it
 		// if --keep-builtin-bash was passed. Flag lookup uses the registered
 		// name without leading dashes.
@@ -570,8 +679,15 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
+	pi.on("session_tree", async (_event, eventCtx) => {
+		ctx.ui = eventCtx.ui;
+		updateRunningSessionsUi(ctx, { showWidget: true, notifyTree: runningSessions(ctx).length > 0 });
+	});
+
 	pi.on("session_shutdown", async () => {
 		const drained = ctx.store.terminateAll();
+		clearSessionExitWatchers(ctx);
+		updateRunningSessionsUi(ctx);
 		if (drained.length && ctx.ui) {
 			ctx.ui.notify(`unified-exec: terminated ${drained.length} live session(s) on shutdown`, "info");
 		}
@@ -603,6 +719,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
 			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, eventCtx.cwd);
+			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderResponseText(shape) }],
 				details: shape,
@@ -640,6 +757,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
 			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any);
+			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderResponseText(shape) }],
 				details: shape,
@@ -696,7 +814,8 @@ export default function (pi: ExtensionAPI) {
 				exited: session.exited,
 				deadlineMs: Date.now() + 100,
 			});
-			ctx.store.remove(sid);
+			removeSession(ctx, sid);
+			updateRunningSessionsUi(ctx);
 			const text = decode(collected);
 			const details = {
 				session_id: sid,
@@ -724,13 +843,15 @@ export default function (pi: ExtensionAPI) {
 		description: "List all live unified-exec sessions in this pi run.",
 		promptSnippet: "List live sessions",
 		parameters: Type.Object({}),
-		async execute() {
+		async execute(_toolCallId, _params, _signal, _onUpdate, eventCtx) {
+			ctx.ui ??= eventCtx.ui;
 			// Reap any sessions that have exited silently (e.g., completed between
 			// tool calls without anyone observing them). This mirrors codex's
 			// `refresh_process_state` filter when enumerating live processes.
 			for (const s of ctx.store.values()) {
-				if (s.hasExited) ctx.store.remove(s.id);
+				if (s.hasExited) removeSession(ctx, s.id);
 			}
+			updateRunningSessionsUi(ctx);
 			const now = Date.now();
 			const sessions = ctx.store.values().map((s) => ({
 				session_id: s.id,

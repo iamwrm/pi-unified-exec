@@ -26,12 +26,19 @@ interface ToolDef {
 function makeHarness() {
 	const tools: Record<string, ToolDef> = {};
 	const handlers: Record<string, Array<(event: any, ctx: any) => any>> = {};
+	const uiEvents = {
+		notifications: [] as Array<{ message: string; type?: string }>,
+		statuses: new Map<string, string | undefined>(),
+		widgets: new Map<string, { content: string[] | undefined; options?: unknown }>(),
+	};
 
 	const stubCtx = {
 		cwd: process.cwd(),
 		ui: {
-			notify: (_m: string) => {},
-			setStatus: (_k: string, _v: unknown) => {},
+			notify: (message: string, type?: string) => uiEvents.notifications.push({ message, type }),
+			setStatus: (key: string, value: string | undefined) => uiEvents.statuses.set(key, value),
+			setWidget: (key: string, content: string[] | undefined, options?: unknown) =>
+				uiEvents.widgets.set(key, { content, options }),
 		},
 		hasUI: false,
 	};
@@ -62,8 +69,11 @@ function makeHarness() {
 			return def.execute("test-call-id", params, signal, undefined, stubCtx);
 		},
 		stubCtx,
+		uiEvents,
 		async emit(event: string, evt: any = {}) {
-			for (const h of handlers[event] ?? []) await h(evt, stubCtx);
+			const results = [];
+			for (const h of handlers[event] ?? []) results.push(await h(evt, stubCtx));
+			return results;
 		},
 	};
 }
@@ -219,6 +229,92 @@ describe("unified-exec e2e", () => {
 		// Cleanup.
 		await h.call("kill_session", { session_id: r1.details.session_id });
 		await h.call("kill_session", { session_id: r2.details.session_id });
+		await h.emit("session_shutdown");
+	});
+
+	it("session_tree surfaces running sessions in the TUI", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 10", yield_time_ms: 300 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number");
+
+		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
+		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
+		const widget = h.uiEvents.widgets.get("unified-exec.sessions");
+		const widgetContent = widget?.content;
+		if (!widgetContent) assert.fail(`widget=${JSON.stringify(widget)}`);
+		assert.ok(widgetContent[0].includes("1 session still running"), `widget=${JSON.stringify(widget)}`);
+		assert.ok(widgetContent.some((line) => line.includes(`#${sid}`)), `widget=${JSON.stringify(widget)}`);
+		assert.ok(widgetContent.some((line) => line.includes("write_stdin to poll/drive")));
+		assert.ok(
+			h.uiEvents.notifications.some((n) => n.type === "warning" && n.message.includes("still running after /tree")),
+			`notifications=${JSON.stringify(h.uiEvents.notifications)}`,
+		);
+
+		await h.call("kill_session", { session_id: sid });
+		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), undefined);
+		assert.equal(h.uiEvents.widgets.get("unified-exec.sessions")?.content, undefined);
+		await h.emit("session_shutdown");
+	});
+
+	it("running-session footer clears automatically when a background process exits", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 0.4", yield_time_ms: 250 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
+		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
+
+		await new Promise((r) => setTimeout(r, 700));
+		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), undefined);
+
+		const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5000 });
+		assert.equal(r2.details.exit_code, 0, `details=${JSON.stringify(r2.details)}`);
+		assert.equal(r2.details.session_id, undefined);
+		await h.emit("session_shutdown");
+	});
+
+	it("post-tree running-session widget clears automatically when the process exits", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 0.4", yield_time_ms: 250 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
+
+		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
+		assert.ok(h.uiEvents.widgets.get("unified-exec.sessions")?.content?.[0].includes("1 session still running"));
+
+		await new Promise((r) => setTimeout(r, 700));
+		assert.equal(h.uiEvents.widgets.get("unified-exec.sessions")?.content, undefined);
+
+		const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5000 });
+		assert.equal(r2.details.exit_code, 0, `details=${JSON.stringify(r2.details)}`);
+		await h.emit("session_shutdown");
+	});
+
+	it("running-session UI decrements when one of multiple sessions exits", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const short = await h.call("exec_command", { cmd: "sleep 1.2", yield_time_ms: 250 });
+		const long = await h.call("exec_command", { cmd: "sleep 10", yield_time_ms: 250 });
+		const shortSid = short.details.session_id;
+		const longSid = long.details.session_id;
+		assert.ok(typeof shortSid === "number", `short=${JSON.stringify(short.details)}`);
+		assert.ok(typeof longSid === "number", `long=${JSON.stringify(long.details)}`);
+
+		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
+		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 2 sessions running");
+
+		await new Promise((r) => setTimeout(r, 1100));
+		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
+		const widget = h.uiEvents.widgets.get("unified-exec.sessions")?.content?.join("\n") ?? "";
+		assert.ok(widget.includes(`#${longSid}`), `widget=${widget}`);
+		assert.ok(!widget.includes(`#${shortSid}`), `widget=${widget}`);
+
+		const drained = await h.call("write_stdin", { session_id: shortSid, chars: "", yield_time_ms: 5000 });
+		assert.equal(drained.details.exit_code, 0, `details=${JSON.stringify(drained.details)}`);
+		await h.call("kill_session", { session_id: longSid });
 		await h.emit("session_shutdown");
 	});
 

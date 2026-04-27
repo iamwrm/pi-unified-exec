@@ -80,6 +80,7 @@ export class ExecSession {
 		signal: null,
 		failureMessage: null,
 	};
+	private readonly exitListeners = new Set<(session: ExecSession) => void>();
 	private lastUsedAt: number;
 	private child!: SpawnedChild;
 
@@ -159,6 +160,7 @@ export class ExecSession {
 				failureMessage: self.state.failureMessage,
 			};
 			self.exitedAc.abort();
+			self.notifyExitListeners();
 			// Fire a notify so any parked waiters wake up and see the exit.
 			self.outputNotify.notifyAll();
 			// A short tick later, flush the log stream to disk, then close the
@@ -213,6 +215,28 @@ export class ExecSession {
 			signal: this.state.signal,
 			failureMessage: message,
 		};
+		this.notifyExitListeners();
+	}
+
+	private notifyExitListeners(): void {
+		for (const listener of this.exitListeners) {
+			try {
+				listener(this);
+			} catch {
+				// ignore listener failures
+			}
+		}
+	}
+
+	/** Register a listener fired when this session exits. */
+	onExit(listener: (session: ExecSession) => void): () => void {
+		this.exitListeners.add(listener);
+		if (this.hasExited) {
+			queueMicrotask(() => {
+				if (this.exitListeners.has(listener)) listener(this);
+			});
+		}
+		return () => this.exitListeners.delete(listener);
 	}
 
 	/** Snapshot the current rolling tail (for streaming updates). */
