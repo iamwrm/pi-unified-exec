@@ -2,6 +2,15 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-04-27
+
+### Changed
+
+- **Prompt guideline safety**: changed the `exec_command` file-exploration hint
+  to only prefer `grep`/`find`/`ls` when those dedicated tools are actually
+  available, and to suggest shell fallbacks via `rg`, `fd` when installed,
+  `find`, and `ls` otherwise.
+
 ## 2026-04-21
 
 ### Verified

@@ -586,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 			"Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms.",
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
-			"Prefer grep/find/ls tools over exec_command for file exploration (faster, respects .gitignore).",
+			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
 		],
 		parameters: Type.Object({
