@@ -2,6 +2,14 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-05-27 — 0.3.2
+
+### Changed
+
+- **Longer empty-poll yield cap**: raised empty `write_stdin` poll
+  `yield_time_ms` clamping from 300 seconds to 30 minutes, allowing agents to
+  wait longer on known-running background sessions without repeated polls.
+
 ## 2026-05-06
 
 ### Changed

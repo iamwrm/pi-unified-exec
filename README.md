@@ -122,7 +122,7 @@ Drives or polls an existing session.
 | `session_id` | number | — | Required. |
 | `chars` | string | `""` | Empty = pure poll; non-empty writes (after escape decoding) then polls. Mutually exclusive with `chars_b64`. |
 | `chars_b64` | string | `""` | Base64-encoded bytes to write. Binary-safe. Mutually exclusive with `chars`. |
-| `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, 300_000]. |
+| `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, 1_800_000]. |
 
 #### Control bytes and escapes in `chars`
 
@@ -240,7 +240,7 @@ Codex-parity unless noted:
 MIN_YIELD_TIME_MS            = 250
 MAX_YIELD_TIME_MS            = 30_000
 MIN_EMPTY_YIELD_TIME_MS      = 5_000
-MAX_BACKGROUND_POLL_MS       = 300_000
+MAX_BACKGROUND_POLL_MS       = 1_800_000
 DEFAULT_EXEC_YIELD_MS        = 10_000
 DEFAULT_WRITE_STDIN_YIELD_MS = 250
 EARLY_EXIT_GRACE_PERIOD_MS   = 150

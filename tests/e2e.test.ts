@@ -121,6 +121,29 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
+	it("empty write_stdin poll clamps yield_time_ms to 30 minutes", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", {
+			cmd: "sleep 0.4",
+			yield_time_ms: 250,
+		});
+		assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
+		const sid = r1.details.session_id;
+
+		await new Promise((r) => setTimeout(r, 700));
+
+		const r2 = await h.call("write_stdin", {
+			session_id: sid,
+			chars: "",
+			yield_time_ms: 2_000_000,
+		});
+		assert.equal(r2.details.yield_time_ms, 1_800_000);
+		assert.equal(r2.details.session_id, undefined);
+		assert.equal(r2.details.exit_code, 0);
+		await h.emit("session_shutdown");
+	});
+
 	it("long-running command yields session_id and write_stdin resumes", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
