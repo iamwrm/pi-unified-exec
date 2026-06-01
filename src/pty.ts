@@ -242,7 +242,11 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 		exitHandlers.clear();
 		dataHandlers.clear();
 	};
-	child.once("exit", (code, signal) => finalize(code, signal));
+	// Use `close`, not `exit`: on macOS, very short-lived commands can emit the
+	// process `exit` event before stdout/stderr have delivered their final data.
+	// Treating `close` as our completion signal preserves trailing output before
+	// ExecSession drains and finalizes the response.
+	child.once("close", (code, signal) => finalize(code, signal));
 	child.once("error", (err) => {
 		// error → force an "exit" notification so callers don't hang.
 		finalize(null, null);

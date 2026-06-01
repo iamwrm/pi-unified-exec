@@ -2,6 +2,14 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-06-01 — 0.3.4
+
+### Fixed
+
+- **macOS short-command output race**: pipe-mode sessions now wait for the
+  child-process `close` event instead of `exit` before finalizing, preserving
+  trailing stdout/stderr from very short-lived commands in CI.
+
 ## 2026-06-01 — 0.3.3
 
 ### Changed
