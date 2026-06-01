@@ -7,8 +7,8 @@
 [![Publish to npm](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml/badge.svg)](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml)
 
 A pi extension that ports codex's `unified_exec` session model: every bash
-command becomes a long-lived session the LLM drives with short polls, instead
-of a single blocking call the agent waits on.
+command becomes a long-lived session the LLM drives with writes and polls,
+instead of a single blocking call the agent waits on.
 
 Mirrors codex's `exec_command` + `write_stdin` tool surface, with small
 pi-flavor additions (`kill_session`, `list_sessions`).
@@ -28,7 +28,7 @@ pi-flavor additions (`kill_session`, `list_sessions`).
   `read(log_path)` even after the LLM-visible tail truncates.
 - **Bounded waits — the agent never stalls.** Every tool call returns
   within a hard ceiling: 30 s for `exec_command` and `write_stdin`,
-  5 min for pure background polls. A long-running process keeps
+  30 min for pure background polls. A long-running process keeps
   running; the agent just gets control back with a `session_id` and
   can poll again when it chooses.
 - **Ctrl-C and other control bytes, not just stdin text.**
@@ -123,6 +123,14 @@ Drives or polls an existing session.
 | `chars` | string | `""` | Empty = pure poll; non-empty writes (after escape decoding) then polls. Mutually exclusive with `chars_b64`. |
 | `chars_b64` | string | `""` | Base64-encoded bytes to write. Binary-safe. Mutually exclusive with `chars`. |
 | `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, 1_800_000]. |
+
+For known long-running, non-interactive jobs, prefer a single long empty poll
+instead of many short polls. After `exec_command` returns a `session_id`, call
+`write_stdin` with no `chars`/`chars_b64` and a long `yield_time_ms` such as
+`300_000`–`1_800_000`. This is best for builds, test suites, installs,
+downloads, and data processing jobs. Avoid long polls for REPLs, `sudo`, `ssh`,
+password prompts, dev servers, or any command where you may need to send input
+soon.
 
 #### Control bytes and escapes in `chars`
 
@@ -317,7 +325,27 @@ exit_code: 0
 Killed session 1 (pid 12345) with SIGTERM — exit_code=143
 ```
 
-### 2. Interactive Python REPL
+### 2. Long-running non-interactive job
+
+```
+> exec_command(cmd="npm test", yield_time_ms=1000)
+[still running]
+session_id: 2
+---
+> test suite started
+
+> write_stdin(session_id=2, yield_time_ms=1800000)              # one long empty poll
+[exited]
+exit_code: 0
+---
+> all tests passed
+```
+
+Use this pattern instead of repeated short polls when the job does not need
+interaction; it reduces context noise while still returning final output when
+the command exits or the long poll reaches its deadline.
+
+### 3. Interactive Python REPL
 
 ```
 > exec_command(cmd="python3 -q", tty=true, yield_time_ms=1500)
@@ -337,7 +365,7 @@ session_id: 1
 exit_code: 0
 ```
 
-### 3. `sudo` (interactive password)
+### 4. `sudo` (interactive password)
 
 ```
 > exec_command(cmd="sudo -k && sudo whoami", tty=true, yield_time_ms=1500)

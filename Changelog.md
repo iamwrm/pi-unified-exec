@@ -2,6 +2,14 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-06-01 — 0.3.3
+
+### Changed
+
+- **Long-running job polling guidance**: updated the `write_stdin` tool prompt
+  and README to tell models to use a single long empty poll for known
+  non-interactive jobs instead of repeated short polls, reducing context noise.
+
 ## 2026-05-27 — 0.3.2
 
 ### Changed
