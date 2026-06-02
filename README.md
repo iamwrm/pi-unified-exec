@@ -28,9 +28,9 @@ pi-flavor additions (`kill_session`, `list_sessions`).
   `read(log_path)` even after the LLM-visible tail truncates.
 - **Bounded waits — the agent never stalls.** Every tool call returns
   within a hard ceiling: 30 s for `exec_command` and `write_stdin`,
-  5 min for pure background polls. A long-running process keeps
-  running; the agent just gets control back with a `session_id` and
-  can poll again when it chooses.
+  30 min by default for pure background polls. A long-running process
+  keeps running; the agent just gets control back with a `session_id`
+  and can poll again when it chooses.
 - **Ctrl-C and other control bytes, not just stdin text.**
   `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
   `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
@@ -122,15 +122,21 @@ Drives or polls an existing session.
 | `session_id` | number | — | Required. |
 | `chars` | string | `""` | Empty = pure poll; non-empty writes (after escape decoding) then polls. Mutually exclusive with `chars_b64`. |
 | `chars_b64` | string | `""` | Base64-encoded bytes to write. Binary-safe. Mutually exclusive with `chars`. |
-| `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, 300_000]. |
+| `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, configured cap]. Default cap: 1_800_000. |
 
 For known long-running, non-interactive jobs, prefer a single long empty poll
 instead of many short polls. After `exec_command` returns a `session_id`, call
-`write_stdin` with no `chars`/`chars_b64` and a long `yield_time_ms` up to
-`300_000` (5 minutes). This is best for builds, test suites, installs,
-downloads, and data processing jobs, while staying inside the typical 5-minute
-prompt-cache expiry window. Avoid long polls for REPLs, `sudo`, `ssh`, password
-prompts, dev servers, or any command where you may need to send input soon.
+`write_stdin` with no `chars`/`chars_b64` and a long `yield_time_ms` up to the
+configured cap (`1_800_000`, or 30 minutes, by default). This is best for
+builds, test suites, installs, downloads, and data processing jobs. Avoid long
+polls for REPLs, `sudo`, `ssh`, password prompts, dev servers, or any command
+where you may need to send input soon.
+
+#### Empty-poll cap configuration
+
+| Env var | Default | Notes |
+|---|---|---|
+| `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | `1_800_000` | Maximum wait for an empty `write_stdin` poll. Invalid/unset values use the default; positive values below `5_000` are raised to `5_000`. Set `300_000` to keep long polls within common 5-minute prompt-cache expiry windows. |
 
 #### Control bytes and escapes in `chars`
 
@@ -248,7 +254,7 @@ Codex-parity unless noted:
 MIN_YIELD_TIME_MS            = 250
 MAX_YIELD_TIME_MS            = 30_000
 MIN_EMPTY_YIELD_TIME_MS      = 5_000
-MAX_BACKGROUND_POLL_MS       = 300_000
+DEFAULT_MAX_BACKGROUND_POLL_MS = 1_800_000  (env override: PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS)
 DEFAULT_EXEC_YIELD_MS        = 10_000
 DEFAULT_WRITE_STDIN_YIELD_MS = 250
 EARLY_EXIT_GRACE_PERIOD_MS   = 150
@@ -334,7 +340,7 @@ session_id: 2
 ---
 > test suite started
 
-> write_stdin(session_id=2, yield_time_ms=300000)               # one long empty poll
+> write_stdin(session_id=2, yield_time_ms=1800000)              # one long empty poll
 [exited]
 exit_code: 0
 ---

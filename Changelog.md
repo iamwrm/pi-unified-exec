@@ -2,6 +2,15 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-06-02 — 0.3.6
+
+### Changed
+
+- **Configurable empty-poll cap**: restored the default pure `write_stdin`
+  empty-poll `yield_time_ms` cap to 30 minutes and added
+  `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` so cache-sensitive environments can lower
+  the cap (for example to 300 seconds / 5 minutes).
+
 ## 2026-06-02 — 0.3.5
 
 ### Changed
@@ -9,7 +18,7 @@ All notable changes to this project. **Newest entries go on top.**
 - **Empty-poll cache safety**: reverted pure `write_stdin` poll
   `yield_time_ms` clamping from 30 minutes back to 5 minutes (300 seconds) and
   updated model guidance/docs so long polls stay within typical prompt-cache
-  expiry windows.
+  expiry windows. Superseded by 0.3.6's configurable cap.
 
 ## 2026-06-01 — 0.3.4
 

@@ -10,7 +10,7 @@
 import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import extensionFactory from "../src/index.ts";
+import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
 
 interface ToolDef {
 	name: string;
@@ -79,6 +79,13 @@ function makeHarness() {
 }
 
 describe("unified-exec e2e", () => {
+	it("resolveMaxEmptyPollMs reads the empty-poll cap env var", () => {
+		assert.equal(resolveMaxEmptyPollMs({}), 1_800_000);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 300_000);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 1_800_000);
+	});
+
 	it("short-lived command returns exit_code and no session_id", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
@@ -121,27 +128,64 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("empty write_stdin poll clamps yield_time_ms to 5 minutes", async () => {
+	it("empty write_stdin poll clamps yield_time_ms to 30 minutes by default", async () => {
+		const previous = process.env[MAX_EMPTY_POLL_ENV_VAR];
+		delete process.env[MAX_EMPTY_POLL_ENV_VAR];
 		const h = makeHarness();
-		await h.emit("session_start");
-		const r1 = await h.call("exec_command", {
-			cmd: "sleep 0.4",
-			yield_time_ms: 250,
-		});
-		assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
-		const sid = r1.details.session_id;
+		try {
+			await h.emit("session_start");
+			const r1 = await h.call("exec_command", {
+				cmd: "sleep 0.4",
+				yield_time_ms: 250,
+			});
+			assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
+			const sid = r1.details.session_id;
 
-		await new Promise((r) => setTimeout(r, 700));
+			await new Promise((r) => setTimeout(r, 700));
 
-		const r2 = await h.call("write_stdin", {
-			session_id: sid,
-			chars: "",
-			yield_time_ms: 2_000_000,
-		});
-		assert.equal(r2.details.yield_time_ms, 300_000);
-		assert.equal(r2.details.session_id, undefined);
-		assert.equal(r2.details.exit_code, 0);
-		await h.emit("session_shutdown");
+			const r2 = await h.call("write_stdin", {
+				session_id: sid,
+				chars: "",
+				yield_time_ms: 2_000_000,
+			});
+			assert.equal(r2.details.yield_time_ms, 1_800_000);
+			assert.equal(r2.details.session_id, undefined);
+			assert.equal(r2.details.exit_code, 0);
+		} finally {
+			if (previous === undefined) delete process.env[MAX_EMPTY_POLL_ENV_VAR];
+			else process.env[MAX_EMPTY_POLL_ENV_VAR] = previous;
+			await h.emit("session_shutdown");
+		}
+	});
+
+	it("empty write_stdin poll cap can be lowered with env var", async () => {
+		const previous = process.env[MAX_EMPTY_POLL_ENV_VAR];
+		process.env[MAX_EMPTY_POLL_ENV_VAR] = "300000";
+		const h = makeHarness();
+		try {
+			await h.emit("session_start");
+			const r1 = await h.call("exec_command", {
+				cmd: "sleep 0.4",
+				yield_time_ms: 250,
+			});
+			assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
+			const sid = r1.details.session_id;
+
+			await new Promise((r) => setTimeout(r, 700));
+
+			const r2 = await h.call("write_stdin", {
+				session_id: sid,
+				chars: "",
+				yield_time_ms: 2_000_000,
+			});
+			assert.equal(r2.details.yield_time_ms, 300_000);
+			assert.equal(r2.details.session_id, undefined);
+			assert.equal(r2.details.exit_code, 0);
+		} finally {
+			if (previous === undefined) delete process.env[MAX_EMPTY_POLL_ENV_VAR];
+			else process.env[MAX_EMPTY_POLL_ENV_VAR] = previous;
+			await h.emit("session_shutdown");
+		}
 	});
 
 	it("long-running command yields session_id and write_stdin resumes", async () => {
