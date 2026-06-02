@@ -2,6 +2,15 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-06-02 — 0.3.5
+
+### Changed
+
+- **Empty-poll cache safety**: reverted pure `write_stdin` poll
+  `yield_time_ms` clamping from 30 minutes back to 5 minutes (300 seconds) and
+  updated model guidance/docs so long polls stay within typical prompt-cache
+  expiry windows.
+
 ## 2026-06-01 — 0.3.4
 
 ### Fixed
@@ -25,6 +34,7 @@ All notable changes to this project. **Newest entries go on top.**
 - **Longer empty-poll yield cap**: raised empty `write_stdin` poll
   `yield_time_ms` clamping from 300 seconds to 30 minutes, allowing agents to
   wait longer on known-running background sessions without repeated polls.
+  Superseded by the 2026-06-02 cache-safety revert.
 
 ## 2026-05-06
 

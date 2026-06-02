@@ -121,7 +121,7 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("empty write_stdin poll clamps yield_time_ms to 30 minutes", async () => {
+	it("empty write_stdin poll clamps yield_time_ms to 5 minutes", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		const r1 = await h.call("exec_command", {
@@ -138,7 +138,7 @@ describe("unified-exec e2e", () => {
 			chars: "",
 			yield_time_ms: 2_000_000,
 		});
-		assert.equal(r2.details.yield_time_ms, 1_800_000);
+		assert.equal(r2.details.yield_time_ms, 300_000);
 		assert.equal(r2.details.session_id, undefined);
 		assert.equal(r2.details.exit_code, 0);
 		await h.emit("session_shutdown");
