@@ -187,9 +187,21 @@ Pi-flavor. Not in codex.
 | `session_id` | number | — | Required. |
 | `signal` | string | `"SIGTERM"` | Escalates to SIGKILL after 2s. Pass `"SIGKILL"` to skip the grace. |
 
+Signal names are normalized (`term`, `INT`, `sigkill` all work). Unknown
+names are rejected with an error instead of silently no-opping.
+
 ### `list_sessions`
 
-Pi-flavor. Not in codex. Also prunes exited sessions from the in-memory store.
+Pi-flavor. Not in codex. Prunes exited sessions from the in-memory store, but
+reports each of them one final time (with `running: false`, `exit_code` /
+`signal`, and `log_path`) so exit information is never silently lost.
+
+## Command
+
+- `/unified-exec-sessions` — human-facing escape hatch: lists live sessions in
+  a selector and kills the chosen one (or all of them) without going through
+  the model. Uses the same SIGTERM → 2s → SIGKILL escalation as
+  `kill_session`.
 
 ## Flag
 
@@ -233,6 +245,7 @@ $ for i in {1..12}; do echo round $i; sleep 0.5; done (yield 2.5s · cwd: ~/proj
 ⟳ poll → session_id=2 (yield 5.0s)               # empty chars
 » print(7*6)\n → session_id=1 (yield 1.0s)         # with input
 » ^C → session_id=1 (yield 1.0s)                  # control byte
+» (base64, 5 bytes) → session_id=1 (yield 1.0s)   # chars_b64 payload
 ```
 
 **Running-session UI:** while any unified-exec process is still alive, the TUI
@@ -277,12 +290,21 @@ PREVIEW_LINES                = 5       (TUI preview lines before ctrl+o expand)
 - **Session persistence between calls**: if a process exits after a tool call
   returns but before the next one, the session stays in the store. The next
   `write_stdin(session_id, …)` call will observe the exit and return
-  `exit_code`, then remove the session. (Matches codex's
-  `refresh_process_state` pattern.)
+  `exit_code`, then remove the session; `list_sessions` reports it once with
+  exit info before removing it. (Matches codex's `refresh_process_state`
+  pattern.)
+- **Spawn failures are diagnosable**: a nonexistent shell binary or `workdir`
+  (async ENOENT from the OS) surfaces as `failure_message` in the response
+  instead of a silent empty exit.
+- **Closed stdin is safe**: a child that closes its stdin no longer crashes
+  the host on EPIPE; follow-up `write_stdin` calls report
+  `failure_message: "stdin write failed: …"` when bytes can't be delivered.
 - **External abort (Esc)**: breaks the current call's wait but does not kill
   the session. The next turn can still drive it.
-- **Session shutdown**: all live sessions are terminated. Codex behavior.
-  (Use the separate `bash-background` extension if you need true disown.)
+- **Session shutdown**: all live sessions are terminated with SIGTERM; after a
+  1s grace, survivors (e.g. children that trap SIGTERM) are SIGKILLed so
+  detached process groups don't outlive pi. (Use the separate
+  `bash-background` extension if you need true disown.)
 - **LRU eviction**: at `MAX_SESSIONS`, the oldest non-protected session is
   evicted. The 8 most-recently-used are never pruned. Exited sessions are
   preferred as victims.
@@ -396,15 +418,18 @@ npm install
 npx tsx --test tests/*.test.ts
 ```
 
-102 tests across 9 files: HeadTailBuffer (direct port of codex's unit
-tests), Notify/Gate/sleep, collectOutputUntilDeadline (9 scenarios),
-SessionStore LRU (10 scenarios), truncateTail (ported from pi, 13
-scenarios), unescapeChars (14 scenarios for `\xHH`/`\uHHHH`/`\u{…}`/unknown
-escapes/Windows path footguns), chars-encoding end-to-end (13 scenarios
-covering raw bytes, escape decoding, chars_b64 binary-safety, and
-mutual-exclusion errors), full e2e pipes (17 scenarios incl. log-file
-retention + byte/line truncation + cwd/command fields), PTY mode (3
-scenarios: simple command, Python REPL drive, Ctrl-C injection).
+129 tests across 10 files: HeadTailBuffer (direct port of codex's unit
+tests), Notify/Gate/sleep, collectOutputUntilDeadline (10 scenarios incl.
+abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
+(ported from pi, 13 scenarios), unescapeChars (14 scenarios for
+`\xHH`/`\uHHHH`/`\u{…}`/unknown escapes/Windows path footguns),
+chars-encoding end-to-end (13 scenarios covering raw bytes, escape decoding,
+chars_b64 binary-safety, and mutual-exclusion errors), signal-name mapping,
+full e2e pipes (35+ scenarios incl. log-file retention, byte/line truncation,
+spawn-failure diagnostics, EPIPE safety, exited-session reporting, shutdown
+SIGKILL escalation, onUpdate streaming, and the `/unified-exec-sessions`
+command), PTY mode (3 scenarios: simple command, Python REPL drive, Ctrl-C
+injection).
 
 ## Improvements over codex
 

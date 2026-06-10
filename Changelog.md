@@ -2,6 +2,71 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-06-10 — 0.4.0
+
+### Fixed
+
+- **Log-stream error no longer orphans live sessions**: a log-mirroring error
+  (disk full, permissions, …) used to mark the session as exited while the
+  child kept running, making it unkillable (`kill()` no-ops once exited) and
+  letting `list_sessions` drop it without terminating the process. Failures
+  are now recorded on the session without flipping its exited state.
+- **Async spawn errors are diagnosable**: pipe-mode spawn failures delivered
+  via the child's async `error` event (ENOENT shell binary, nonexistent
+  `workdir`) previously produced an empty `[exited]` response with no
+  exit_code, signal, failure, or output. The error message (plus a
+  shell/workdir hint for ENOENT) is now surfaced as `failure_message`.
+- **EPIPE no longer crashes the host**: `child.stdin` had no `error` handler,
+  so writing to a child that closed its stdin raised an unhandled stream
+  `error` event and crashed the whole pi process. Errors are now swallowed,
+  and `write_stdin` reports `failure_message: "stdin write failed: …"` when
+  bytes cannot be delivered to a live session (stdin destroyed/ended).
+  `write()` also no longer conflates stream backpressure with delivery
+  failure.
+- **collectOutputUntilDeadline listener/timer leak**: each loop iteration
+  registered fresh `abort` listeners on the exit/external signals and started
+  a fresh deadline timer without ever cleaning them up — chatty processes
+  tripped Node's EventTarget max-listener warning after ~10 chunks, and a
+  30-minute empty poll could accumulate thousands of live timers. The
+  deadline/abort promises are now created once per call and all
+  listeners/timers are released when the call returns. The no-external-abort
+  placeholder promise is also scoped per call (not module-global) so race
+  reactions attached to it stay garbage-collectable.
+- **PTY signal mapping covers the full platform table**: the numeric→name
+  signal map was a hand-picked 6-entry table, so tty-mode children killed by
+  SIGSEGV/SIGPIPE/SIGUSR1/… were reported as `exit_code=0`. The map is now
+  built from `os.constants.signals` (exported as `signalNameFromNumber`).
+- **`write_stdin` rendering of `chars_b64`**: calls carrying only a base64
+  payload rendered as `⟳ poll`; they now render as `» (base64, N bytes)`.
+- **`kill_session` signal validation**: signal names are normalized (`term`,
+  `INT`, `sigkill` all work) and unknown names are rejected with an error
+  instead of silently no-opping and then escalating to SIGKILL anyway.
+
+### Changed
+
+- **`list_sessions` reports exited sessions once before pruning**: instead of
+  silently dropping sessions that exited between tool calls, the listing now
+  includes them one final time with `running: false`, `exit_code`/`signal`,
+  `failure_message`, and `log_path` (`active_count` still counts only live
+  sessions), preserving the "exit information is never silently lost"
+  guarantee.
+- **Shutdown escalates to SIGKILL**: `session_shutdown` now waits up to 1s for
+  SIGTERM'd children to exit and SIGKILLs survivors (children run in detached
+  process groups and would otherwise outlive pi when they trap SIGTERM).
+- **Removed dead `HEAD_TAIL_MAX_BYTES` constant** in `src/index.ts` (the
+  per-session buffer cap lives in `src/session.ts`).
+
+### Added
+
+- **`/unified-exec-sessions` command**: human-facing escape hatch that lists
+  live sessions in a selector and kills the chosen one (or all) without going
+  through the model, sharing the kill/escalate/drain logic with
+  `kill_session`.
+- **Streaming parity test**: the e2e harness now captures `onUpdate` and
+  asserts multiple growing partial outputs during a long-running
+  `exec_command`, plus 14 more regression tests covering every fix above
+  (129 tests total across 10 files).
+
 ## 2026-06-02 — 0.3.6
 
 ### Changed

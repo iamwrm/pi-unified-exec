@@ -17,7 +17,7 @@
  */
 
 import type { HeadTailBuffer } from "./head-tail-buffer.ts";
-import { type Gate, type Notify, sleep } from "./notify.ts";
+import type { Gate, Notify } from "./notify.ts";
 
 const POST_EXIT_CLOSE_WAIT_MS = 50;
 
@@ -53,70 +53,99 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 	let exitSignalReceived = exited.aborted;
 	let postExitDeadline: number | undefined;
 
-	for (;;) {
-		if (externalAbort?.aborted) break;
+	// The deadline and both abort signals are fixed for the lifetime of this
+	// call, so their promises are created ONCE and reused in every race below.
+	// Creating them per loop iteration would leak one abort listener and one
+	// timer per output chunk: chatty processes inside a long poll trip Node's
+	// EventTarget max-listener warning and accumulate thousands of live timers.
+	// All listeners/timers are released in the `finally` block.
+	const cleanups: Array<() => void> = [];
+	try {
+		const exitedP = abortPromise(exited, cleanups).then(() => "exit" as const);
+		// Per-call (NOT module-global) so the reactions Promise.race attaches to a
+		// never-settling promise become collectable once this call returns.
+		const externalP: Promise<"external"> = externalAbort
+			? abortPromise(externalAbort, cleanups).then(() => "external" as const)
+			: new Promise<never>(() => {});
+		const deadlineP = timeoutPromise(deadlineMs - Date.now(), cleanups).then(() => "timeout" as const);
+		let closedP: Promise<"closed"> | undefined;
+		let graceP: Promise<"timeout"> | undefined;
 
-		// 1) Drain whatever is currently buffered.
-		const drained = buffer.drainChunks();
+		for (;;) {
+			if (externalAbort?.aborted) break;
 
-		if (drained.length === 0) {
-			if (exited.aborted) exitSignalReceived = true;
-			if (exitSignalReceived && outputClosed.isClosed) break;
+			// 1) Drain whatever is currently buffered.
+			const drained = buffer.drainChunks();
 
-			const now = Date.now();
-			const remaining = Math.max(0, deadlineMs - now);
-			if (remaining === 0) break;
+			if (drained.length === 0) {
+				if (exited.aborted) exitSignalReceived = true;
+				if (exitSignalReceived && outputClosed.isClosed) break;
 
-			if (exitSignalReceived) {
-				// Process exited but stream not closed yet — give it a short grace.
-				if (postExitDeadline === undefined) {
-					postExitDeadline = now + Math.min(remaining, postExitCloseWaitCap);
+				const now = Date.now();
+				if (now >= deadlineMs) break;
+
+				if (exitSignalReceived) {
+					// Process exited but stream not closed yet — give it a short grace.
+					if (postExitDeadline === undefined) {
+						postExitDeadline = now + Math.min(deadlineMs - now, postExitCloseWaitCap);
+						graceP = timeoutPromise(postExitDeadline - now, cleanups).then(() => "timeout" as const);
+					}
+					if (Date.now() >= postExitDeadline) break;
+					closedP ??= outputClosed.closed().then(() => "closed" as const);
+					const which = await Promise.race([
+						outputNotify.notified().then(() => "output" as const),
+						closedP,
+						graceP!,
+						externalP,
+					]);
+					if (which === "timeout" || which === "external") break;
+					continue;
 				}
-				const graceRemaining = Math.max(0, postExitDeadline - Date.now());
-				if (graceRemaining === 0) break;
-				const which = await waitAny([
+
+				// Still running — wait for next event.
+				const which = await Promise.race([
 					outputNotify.notified().then(() => "output" as const),
-					outputClosed.closed().then(() => "closed" as const),
-					sleep(graceRemaining).then(() => "timeout" as const),
-					abortPromise(externalAbort).then(() => "external" as const),
+					exitedP,
+					deadlineP,
+					externalP,
 				]);
 				if (which === "timeout" || which === "external") break;
+				if (which === "exit") exitSignalReceived = true;
 				continue;
 			}
 
-			// Still running — wait for next event.
-			const which = await waitAny([
-				outputNotify.notified().then(() => "output" as const),
-				abortPromise(exited).then(() => "exit" as const),
-				sleep(remaining).then(() => "timeout" as const),
-				abortPromise(externalAbort).then(() => "external" as const),
-			]);
-			if (which === "timeout" || which === "external") break;
-			if (which === "exit") exitSignalReceived = true;
-			continue;
+			// 2) Collected some bytes — keep them and loop.
+			for (const chunk of drained) collected.push(chunk);
+
+			if (exited.aborted) exitSignalReceived = true;
+			if (Date.now() >= deadlineMs) break;
 		}
-
-		// 2) Collected some bytes — keep them and loop.
-		for (const chunk of drained) collected.push(chunk);
-
-		if (exited.aborted) exitSignalReceived = true;
-		if (Date.now() >= deadlineMs) break;
+	} finally {
+		for (const cleanup of cleanups) cleanup();
 	}
 
 	return concat(collected);
 }
 
-/** Return the value of whichever promise resolves first. Tagged with index. */
-function waitAny<T>(ps: Array<Promise<T>>): Promise<T> {
-	return Promise.race(ps);
-}
-
-/** A promise that resolves when the given signal aborts. Never rejects. */
-function abortPromise(signal?: AbortSignal): Promise<void> {
-	if (!signal) return new Promise<void>(() => {}); // pending forever
+/**
+ * A promise that resolves when the signal aborts. The registered listener is
+ * removed via `cleanups` if the signal never fires.
+ */
+function abortPromise(signal: AbortSignal, cleanups: Array<() => void>): Promise<void> {
 	if (signal.aborted) return Promise.resolve();
 	return new Promise<void>((resolve) => {
-		signal.addEventListener("abort", () => resolve(), { once: true });
+		const onAbort = () => resolve();
+		signal.addEventListener("abort", onAbort, { once: true });
+		cleanups.push(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
+/** A cancellable timeout promise; the timer is cleared via `cleanups`. */
+function timeoutPromise(ms: number, cleanups: Array<() => void>): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		cleanups.push(() => clearTimeout(timer));
 	});
 }
 

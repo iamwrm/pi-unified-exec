@@ -25,7 +25,11 @@ Compatibility status:
   verify that live sessions are terminated regardless of optional
   `targetSessionFile` metadata.
 
-## 1. Pin Incremental Streaming Parity
+## 1. Pin Incremental Streaming Parity — RESOLVED (0.4.0)
+
+Resolved: `tests/e2e.test.ts` now captures `onUpdate` through the harness and
+asserts multiple growing partial outputs (with `session_id` in every partial)
+during a long-running `exec_command`.
 
 Pi 0.73.0 makes built-in `bash` output visible while commands run. unified-exec
 already emits partial output through `onUpdate`, but the behavior should be
@@ -64,7 +68,11 @@ Verification gate:
 - `node --import tsx --test tests/e2e.test.ts`
 - `node --import tsx --test tests/*.test.ts`
 
-## 2. Add Human Controls for Live Sessions
+## 2. Add Human Controls for Live Sessions — RESOLVED (0.4.0)
+
+Resolved: the `/unified-exec-sessions` command lists live sessions in a
+selector and kills the chosen one (or all), sharing the kill/escalate/drain
+logic with the `kill_session` tool. Covered by three e2e tests.
 
 The running-session widget makes live sessions visible after `/tree`, but users
 still need the LLM-facing `kill_session`, `write_stdin`, or `list_sessions`

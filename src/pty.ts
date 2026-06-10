@@ -8,6 +8,7 @@
 
 import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
+import { constants as osConstants } from "node:os";
 
 export interface SpawnOptions {
 	command: string[];
@@ -20,9 +21,16 @@ export interface SpawnOptions {
 
 /**
  * Signature for the "something exited" callback. `exitCode` may be null when
- * killed by a signal (and `signal` is set in that case).
+ * killed by a signal (and `signal` is set in that case). `failureMessage` is
+ * set when the "exit" was actually an async spawn/runtime error (e.g. ENOENT
+ * for a missing shell binary or a bad cwd) so callers can surface a
+ * diagnosable failure instead of a silent empty exit.
  */
-export type ExitCallback = (exitCode: number | null, signal: NodeJS.Signals | null) => void;
+export type ExitCallback = (
+	exitCode: number | null,
+	signal: NodeJS.Signals | null,
+	failureMessage?: string,
+) => void;
 
 export interface SpawnedChild {
 	readonly pid: number | undefined;
@@ -91,15 +99,19 @@ function loadPty(): void {
 	}
 }
 
-// Numeric signal → name, so our ExitCallback always reports SIG* strings.
-const SIGNAL_NAMES: Record<number, NodeJS.Signals> = {
-	1: "SIGHUP",
-	2: "SIGINT",
-	3: "SIGQUIT",
-	6: "SIGABRT",
-	9: "SIGKILL",
-	15: "SIGTERM",
-};
+// Numeric signal → name, built from the platform's full signal table so our
+// ExitCallback always reports SIG* strings (SIGSEGV, SIGPIPE, SIGUSR1, …
+// included — a hand-picked subset previously made tty-mode crashes look like
+// exit_code=0). First name wins for aliased numbers (e.g. SIGABRT/SIGIOT).
+const SIGNAL_NAMES: Record<number, NodeJS.Signals> = {};
+for (const [name, num] of Object.entries(osConstants.signals)) {
+	if (SIGNAL_NAMES[num] === undefined) SIGNAL_NAMES[num] = name as NodeJS.Signals;
+}
+
+/** Resolve a numeric signal to its SIG* name for the current platform. */
+export function signalNameFromNumber(num: number): NodeJS.Signals | null {
+	return SIGNAL_NAMES[num] ?? null;
+}
 
 /** Spawn a child with PTY or pipes. Throws if PTY requested but unavailable. */
 export function spawnChild(opts: SpawnOptions): SpawnedChild {
@@ -149,7 +161,7 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 		exited = true;
 		dataSub?.dispose?.();
 		exitSub?.dispose?.();
-		const sigName = signal != null ? (SIGNAL_NAMES[signal] ?? null) : null;
+		const sigName = signal != null ? signalNameFromNumber(signal) : null;
 		for (const h of exitHandlers) {
 			try {
 				h(sigName ? null : (exitCode ?? 0), sigName);
@@ -228,13 +240,17 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 	};
 	child.stdout?.on("data", onChunk);
 	child.stderr?.on("data", onChunk);
+	// Swallow async stdin errors (EPIPE when the child closes its stdin while
+	// we still hold the write end). Without this handler a single EPIPE is an
+	// unhandled 'error' event that crashes the entire host process.
+	child.stdin?.on("error", () => {});
 
-	const finalize = (code: number | null, signal: NodeJS.Signals | null) => {
+	const finalize = (code: number | null, signal: NodeJS.Signals | null, failureMessage?: string) => {
 		if (exited) return;
 		exited = true;
 		for (const h of exitHandlers) {
 			try {
-				h(code, signal);
+				h(code, signal, failureMessage);
 			} catch {
 				// ignore
 			}
@@ -248,18 +264,25 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 	// ExecSession drains and finalizes the response.
 	child.once("close", (code, signal) => finalize(code, signal));
 	child.once("error", (err) => {
-		// error → force an "exit" notification so callers don't hang.
-		finalize(null, null);
-		// Swallow by default; runtime callers can detect via finalize path.
-		void err;
+		// Async spawn/runtime failure (ENOENT shell binary, nonexistent cwd, …).
+		// Force an "exit" notification so callers don't hang, and carry the
+		// error message so the LLM sees a diagnosable failure.
+		const base = err?.message ?? String(err);
+		const msg = /ENOENT/.test(base) ? `${base} (check shell binary and workdir: ${opts.cwd})` : base;
+		finalize(null, null, `process error: ${msg}`);
 	});
 
 	return {
 		pid: child.pid,
 		tty: false,
 		write(data) {
-			if (exited || !child.stdin || child.stdin.destroyed) return false;
-			return child.stdin.write(Buffer.from(data));
+			const stdin = child.stdin;
+			if (exited || !stdin || stdin.destroyed || stdin.writableEnded) return false;
+			// Ignore the backpressure return value of stream.write(): `false`
+			// there means "queued, buffer full", not "dropped". Our contract is
+			// `false` = bytes were NOT accepted.
+			stdin.write(Buffer.from(data));
+			return true;
 		},
 		onData(handler) {
 			dataHandlers.add(handler);

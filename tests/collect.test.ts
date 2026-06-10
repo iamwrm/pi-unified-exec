@@ -10,6 +10,7 @@
  */
 
 import { strict as assert } from "node:assert";
+import { getEventListeners } from "node:events";
 import { describe, it } from "node:test";
 import { collectOutputUntilDeadline } from "../src/collect.ts";
 import { HeadTailBuffer } from "../src/head-tail-buffer.ts";
@@ -57,6 +58,30 @@ function makeHarness() {
 }
 
 describe("collectOutputUntilDeadline", () => {
+	it("does not accumulate abort listeners across chatty iterations", async () => {
+		const h = makeHarness();
+		// Wake the collector many times within one call. A per-iteration
+		// abortPromise()/sleep() implementation leaks one listener + one timer
+		// per wakeup (and trips Node's EventTarget max-listener warning at >10).
+		const interval = setInterval(() => h.push("x"), 10);
+		try {
+			const out = await collectOutputUntilDeadline({
+				buffer: h.buffer,
+				outputNotify: h.outputNotify,
+				outputClosed: h.outputClosed,
+				exited: h.exited,
+				deadlineMs: Date.now() + 400,
+				externalAbort: h.external,
+			});
+			assert.ok(out.length >= 15, `expected many chunks; got ${out.length}`);
+		} finally {
+			clearInterval(interval);
+		}
+		// All listeners must be released once the call returns.
+		assert.equal(getEventListeners(h.exited, "abort").length, 0);
+		assert.equal(getEventListeners(h.external, "abort").length, 0);
+	});
+
 	it("returns buffered bytes and honors deadline", async () => {
 		const h = makeHarness();
 		h.push("hello");

@@ -26,10 +26,13 @@ interface ToolDef {
 function makeHarness() {
 	const tools: Record<string, ToolDef> = {};
 	const handlers: Record<string, Array<(event: any, ctx: any) => any>> = {};
+	const commands: Record<string, { description?: string; handler: (args: string, ctx: any) => Promise<void> }> = {};
 	const uiEvents = {
 		notifications: [] as Array<{ message: string; type?: string }>,
 		statuses: new Map<string, string | undefined>(),
 		widgets: new Map<string, { content: string[] | undefined; options?: unknown }>(),
+		// Queue of responders for ui.select(); each gets the options array.
+		selectResponses: [] as Array<(options: string[]) => string | undefined>,
 	};
 
 	const stubCtx = {
@@ -39,6 +42,10 @@ function makeHarness() {
 			setStatus: (key: string, value: string | undefined) => uiEvents.statuses.set(key, value),
 			setWidget: (key: string, content: string[] | undefined, options?: unknown) =>
 				uiEvents.widgets.set(key, { content, options }),
+			select: (_title: string, options: string[]) => {
+				const responder = uiEvents.selectResponses.shift();
+				return Promise.resolve(responder ? responder(options) : undefined);
+			},
 		},
 		hasUI: false,
 	};
@@ -50,7 +57,9 @@ function makeHarness() {
 		on: (event: string, handler: (e: any, ctx: any) => any) => {
 			(handlers[event] ??= []).push(handler);
 		},
-		registerCommand: () => {},
+		registerCommand: (name: string, options: any) => {
+			commands[name] = options;
+		},
 		registerShortcut: () => {},
 		registerFlag: () => {},
 		registerMessageRenderer: () => {},
@@ -63,10 +72,15 @@ function makeHarness() {
 	(extensionFactory as any)(pi);
 
 	return {
-		async call(toolName: string, params: any, signal?: AbortSignal) {
+		async call(toolName: string, params: any, signal?: AbortSignal, onUpdate?: (partial: any) => void) {
 			const def = tools[toolName];
 			if (!def) throw new Error(`no such tool: ${toolName}`);
-			return def.execute("test-call-id", params, signal, undefined, stubCtx);
+			return def.execute("test-call-id", params, signal, onUpdate, stubCtx);
+		},
+		async invokeCommand(name: string, args = "") {
+			const cmd = commands[name];
+			if (!cmd) throw new Error(`no such command: ${name}`);
+			return cmd.handler(args, stubCtx);
 		},
 		stubCtx,
 		uiEvents,
@@ -552,6 +566,178 @@ describe("unified-exec e2e", () => {
 		const sid = r1.details.session_id;
 		const r2 = await h.call("kill_session", { session_id: sid });
 		assert.equal(r2.details.log_path, r1.details.log_path);
+		await h.emit("session_shutdown");
+	});
+
+	it("nonexistent shell binary surfaces a failure_message", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r = await h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" });
+		assert.equal(r.details.session_id, undefined, JSON.stringify(r.details));
+		assert.ok(
+			typeof r.details.failure_message === "string" && /ENOENT/.test(r.details.failure_message),
+			`expected ENOENT failure_message; got ${JSON.stringify(r.details)}`,
+		);
+		assert.ok(r.content[0].text.includes("failure:"), r.content[0].text);
+		await h.emit("session_shutdown");
+	});
+
+	it("nonexistent workdir surfaces a failure_message", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r = await h.call("exec_command", { cmd: "echo hi", workdir: "/definitely/not/a/real/dir" });
+		assert.equal(r.details.session_id, undefined, JSON.stringify(r.details));
+		assert.ok(
+			typeof r.details.failure_message === "string" && /ENOENT/.test(r.details.failure_message),
+			`expected ENOENT failure_message; got ${JSON.stringify(r.details)}`,
+		);
+		await h.emit("session_shutdown");
+	});
+
+	it("write_stdin to a child that closed stdin does not crash the host (EPIPE)", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "exec 0<&-; sleep 3", yield_time_ms: 300 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number", JSON.stringify(r1.details));
+		// First write hits EPIPE asynchronously; must be swallowed, not crash.
+		const r2 = await h.call("write_stdin", { session_id: sid, chars: "hello\n", yield_time_ms: 300 });
+		assert.ok(r2.details.session_id === sid || r2.details.exit_code !== undefined, JSON.stringify(r2.details));
+		// By now the stdin stream is destroyed; a follow-up write should report
+		// the failure instead of silently dropping the bytes.
+		const r3 = await h.call("write_stdin", { session_id: sid, chars: "again\n", yield_time_ms: 300 });
+		if (r3.details.session_id !== undefined) {
+			assert.ok(
+				typeof r3.details.failure_message === "string" && r3.details.failure_message.includes("stdin"),
+				`expected stdin failure note; got ${JSON.stringify(r3.details)}`,
+			);
+			await h.call("kill_session", { session_id: sid });
+		}
+		await h.emit("session_shutdown");
+	});
+
+	it("kill_session normalizes signal names (lowercase, no SIG prefix)", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 60", yield_time_ms: 300 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number");
+		const r2 = await h.call("kill_session", { session_id: sid, signal: "term" });
+		assert.equal(r2.details.session_id, sid);
+		assert.ok(r2.details.signal === "SIGTERM" || r2.details.exit_code != null, JSON.stringify(r2.details));
+		await h.emit("session_shutdown");
+	});
+
+	it("kill_session rejects unknown signal names instead of silently no-opping", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		await assert.rejects(() => h.call("kill_session", { session_id: 1, signal: "BOGUS" }), /unknown signal/);
+		await h.emit("session_shutdown");
+	});
+
+	it("list_sessions reports just-exited sessions once with exit info, then removes them", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 0.3", yield_time_ms: 250 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number", JSON.stringify(r1.details));
+		await new Promise((r) => setTimeout(r, 600));
+
+		const l1 = await h.call("list_sessions", {});
+		assert.equal(l1.details.active_count, 0, JSON.stringify(l1.details));
+		const entry = l1.details.sessions.find((s: any) => s.session_id === sid);
+		assert.ok(entry, `exited session should be reported once: ${JSON.stringify(l1.details)}`);
+		assert.equal(entry.running, false);
+		assert.equal(entry.exit_code, 0);
+		assert.ok(l1.content[0].text.includes("exited"), l1.content[0].text);
+
+		const l2 = await h.call("list_sessions", {});
+		assert.equal(l2.details.sessions.length, 0, JSON.stringify(l2.details));
+		await h.emit("session_shutdown");
+	});
+
+	it("session_shutdown SIGKILLs children that trap SIGTERM", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "trap '' TERM; sleep 30", yield_time_ms: 300 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number", JSON.stringify(r1.details));
+		const l = await h.call("list_sessions", {});
+		const pid = l.details.sessions.find((s: any) => s.session_id === sid)?.pid;
+		assert.ok(typeof pid === "number");
+
+		await h.emit("session_shutdown");
+		await new Promise((r) => setTimeout(r, 200));
+		assert.throws(() => process.kill(pid, 0), /ESRCH/, `pid ${pid} should be dead after shutdown`);
+	});
+
+	it("onUpdate streams growing partial output while running", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const updates: any[] = [];
+		const r = await h.call(
+			"exec_command",
+			{ cmd: "for i in 1 2 3 4; do echo beat-$i; sleep 0.25; done", yield_time_ms: 1500 },
+			undefined,
+			(partial: any) => updates.push(partial),
+		);
+		assert.ok(updates.length >= 2, `expected >=2 partial updates; got ${updates.length}`);
+		const first = updates[0];
+		const last = updates[updates.length - 1];
+		assert.ok(typeof first.details.output === "string");
+		assert.ok(last.details.output.length >= first.details.output.length, "output should grow");
+		assert.ok(last.details.output.includes("beat-1"), last.details.output);
+		assert.ok(
+			updates.every((u) => typeof u.details.session_id === "number"),
+			"partial updates should carry session_id",
+		);
+		if (r.details.session_id !== undefined) {
+			await h.call("kill_session", { session_id: r.details.session_id });
+		}
+		await h.emit("session_shutdown");
+	});
+
+	it("/unified-exec-sessions command kills a selected session", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number");
+
+		h.uiEvents.selectResponses.push((options) => options.find((o) => o.startsWith(`#${sid} `)));
+		await h.invokeCommand("unified-exec-sessions");
+
+		const l = await h.call("list_sessions", {});
+		assert.equal(l.details.active_count, 0, JSON.stringify(l.details));
+		assert.ok(
+			h.uiEvents.notifications.some((n) => n.message.includes("killed 1")),
+			JSON.stringify(h.uiEvents.notifications),
+		);
+		await h.emit("session_shutdown");
+	});
+
+	it("/unified-exec-sessions command can kill all sessions", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
+		await h.call("exec_command", { cmd: "sleep 31", yield_time_ms: 250 });
+
+		h.uiEvents.selectResponses.push((options) => options.find((o) => o.startsWith("Kill all")));
+		await h.invokeCommand("unified-exec-sessions");
+
+		const l = await h.call("list_sessions", {});
+		assert.equal(l.details.active_count, 0, JSON.stringify(l.details));
+		await h.emit("session_shutdown");
+	});
+
+	it("/unified-exec-sessions notifies when there is nothing to kill", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		await h.invokeCommand("unified-exec-sessions");
+		assert.ok(
+			h.uiEvents.notifications.some((n) => n.message.includes("no live sessions")),
+			JSON.stringify(h.uiEvents.notifications),
+		);
 		await h.emit("session_shutdown");
 	});
 });

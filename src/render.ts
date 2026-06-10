@@ -109,7 +109,7 @@ export function renderExecCommandCall(
 // ---------------- renderCall for write_stdin ----------------
 
 export function renderWriteStdinCall(
-	args: { session_id?: number; chars?: string; yield_time_ms?: number },
+	args: { session_id?: number; chars?: string; chars_b64?: string; yield_time_ms?: number },
 	theme: Theme,
 	context: ToolRenderContext<RenderState, typeof args>,
 ): Component {
@@ -121,17 +121,27 @@ export function renderWriteStdinCall(
 
 	const sid = args?.session_id !== undefined ? args.session_id : "?";
 	const chars = args?.chars ?? "";
-	const isPoll = chars.length === 0;
+	const b64 = args?.chars_b64 ?? "";
+	const isPoll = chars.length === 0 && b64.length === 0;
 	const yieldMs = args?.yield_time_ms;
 	const op = isPoll
 		? theme.fg("muted", "⟳ poll")
-		: theme.fg("toolTitle", theme.bold(`» ${stringifyChars(chars)}`));
+		: chars.length > 0
+			? theme.fg("toolTitle", theme.bold(`» ${stringifyChars(chars)}`))
+			: theme.fg("toolTitle", theme.bold(`» (base64, ${base64ByteLength(b64)} bytes)`));
 	const yieldSuffix = yieldMs ? theme.fg("muted", ` (yield ${(yieldMs / 1000).toFixed(1)}s)`) : "";
 	const banner = `${op} ${theme.fg("muted", `→ session_id=${sid}`)}${yieldSuffix}`;
 
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 	text.setText(banner);
 	return text;
+}
+
+/** Approximate decoded byte length of a base64 payload (for the banner). */
+function base64ByteLength(b64: string): number {
+	const compact = b64.replace(/\s+/g, "");
+	const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
+	return Math.max(0, Math.floor((compact.length * 3) / 4) - padding);
 }
 
 function stringifyChars(chars: string): string {

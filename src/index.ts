@@ -23,6 +23,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { constants as osConstants } from "node:os";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -52,7 +53,6 @@ export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
-const HEAD_TAIL_MAX_BYTES = 1_048_576; // 1 MiB
 const MAX_SESSIONS = 64;
 const WARNING_SESSIONS = 60;
 const LRU_PROTECTED_COUNT = 8;
@@ -82,6 +82,21 @@ export function resolveMaxEmptyPollMs(env: NodeJS.ProcessEnv = process.env): num
 function clampEmptyPollYield(ms: number | undefined): number {
 	const v = typeof ms === "number" && ms > 0 ? ms : DEFAULT_WRITE_STDIN_YIELD_MS;
 	return clamp(Math.floor(v), MIN_EMPTY_YIELD_TIME_MS, resolveMaxEmptyPollMs());
+}
+
+/**
+ * Normalize a user/LLM-supplied signal name ("TERM", "sigint", "SIGKILL") to
+ * a valid NodeJS.Signals for the current platform. Throws on unknown names so
+ * a typo doesn't silently no-op and then escalate to SIGKILL.
+ */
+function normalizeSignal(raw: string | undefined): NodeJS.Signals {
+	if (!raw) return "SIGTERM";
+	let name = raw.trim().toUpperCase();
+	if (!name.startsWith("SIG")) name = `SIG${name}`;
+	if (!(name in osConstants.signals)) {
+		throw new Error(`unknown signal "${raw}" (use SIGTERM, SIGINT, SIGKILL, …)`);
+	}
+	return name as NodeJS.Signals;
 }
 
 function generateChunkId(): string {
@@ -311,10 +326,11 @@ async function runExecCommand(
 	if (count >= WARNING_SESSIONS) {
 		ctx.ui?.notify(`unified-exec: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
 	}
-	// Note: sessions stay in the store until the next tool call (write_stdin /
-	// list_sessions / kill_session) observes the exit and removes them lazily.
-	// Matches codex so the LLM can always call write_stdin on a session_id it
-	// was handed and get a proper `exit_code` back, even across turns.
+	// Note: sessions stay in the store until a later tool call observes the
+	// exit: write_stdin returns the final exit_code/output, and list_sessions
+	// reports exited sessions one last time (with exit info) before removing
+	// them. Matches codex's lazy-drain so exit information is never silently
+	// lost across turns.
 
 	// Wait until the yield deadline (or abort/exit). Stream updates meanwhile.
 	const deadlineMs = start + yieldTimeMs;
@@ -382,8 +398,13 @@ async function runWriteStdin(
 	const start = Date.now();
 	session.touch();
 
+	let writeFailure: string | null = null;
 	if (!isEmptyPoll && writeBytes) {
 		const ok = session.write(writeBytes);
+		if (!ok && !session.hasExited) {
+			// Still running but stdin is gone (child closed it / EPIPE earlier).
+			writeFailure = "stdin write failed: the child closed its stdin; bytes were not delivered";
+		}
 		if (!ok && session.hasExited) {
 			// Session already exited; return its final state.
 			const collected = await collectOutputUntilDeadline({
@@ -435,7 +456,7 @@ async function runWriteStdin(
 			sessionId: undefined,
 			exitCode: session.exitCode,
 			signal: session.signal,
-			failure: session.failureMessage,
+			failure: session.failureMessage ?? writeFailure,
 			tty: session.tty,
 			logPath: session.logPath,
 			cwd: session.cwd,
@@ -449,13 +470,59 @@ async function runWriteStdin(
 		sessionId: session.id,
 		exitCode: undefined,
 		signal: null,
-		failure: null,
+		failure: writeFailure,
 		tty: session.tty,
 		logPath: session.logPath,
 		cwd: session.cwd,
 		command: session.displayCommand,
 		yieldTimeMs,
 	});
+}
+
+/** Result of terminating a session via kill_session or the sessions command. */
+interface TerminateOutcome {
+	session: ExecSession;
+	escalated: boolean;
+	finalOutput: string;
+}
+
+/**
+ * Kill a session (initial signal → 2s grace → SIGKILL escalation), drain its
+ * trailing output, and remove it from the store. Shared by the kill_session
+ * tool and the /unified-exec-sessions command.
+ */
+async function terminateSessionById(
+	ctx: ExtensionCtx,
+	sid: number,
+	initial: NodeJS.Signals,
+): Promise<TerminateOutcome | undefined> {
+	const session = ctx.store.get(sid);
+	if (!session) return undefined;
+	session.kill(initial);
+	// Wait up to 2s for exit.
+	const exitDeadline = Date.now() + 2000;
+	while (!session.hasExited && Date.now() < exitDeadline) {
+		await sleep(50);
+	}
+	let escalated = false;
+	if (!session.hasExited) {
+		session.kill("SIGKILL");
+		escalated = true;
+		const kdeadline = Date.now() + 500;
+		while (!session.hasExited && Date.now() < kdeadline) {
+			await sleep(25);
+		}
+	}
+	// Final drain.
+	const collected = await collectOutputUntilDeadline({
+		buffer: session.outputBuffer,
+		outputNotify: session.outputNotify,
+		outputClosed: session.outputClosed,
+		exited: session.exited,
+		deadlineMs: Date.now() + 100,
+	});
+	removeSession(ctx, sid);
+	return { session, escalated, finalOutput: decode(collected) };
 }
 
 interface FinalizeInput {
@@ -700,9 +767,61 @@ export default function (pi: ExtensionAPI) {
 		const drained = ctx.store.terminateAll();
 		clearSessionExitWatchers(ctx);
 		updateRunningSessionsUi(ctx);
+		// Children run detached (own process groups), so anything that ignores
+		// SIGTERM would outlive pi as an orphan. Give them a short grace, then
+		// SIGKILL survivors and wait briefly for confirmation.
+		const graceDeadline = Date.now() + 1000;
+		while (drained.some((s) => !s.hasExited) && Date.now() < graceDeadline) {
+			await sleep(50);
+		}
+		const survivors = drained.filter((s) => !s.hasExited);
+		for (const s of survivors) s.kill("SIGKILL");
+		if (survivors.length) {
+			const killDeadline = Date.now() + 500;
+			while (drained.some((s) => !s.hasExited) && Date.now() < killDeadline) {
+				await sleep(25);
+			}
+		}
 		if (drained.length && ctx.ui) {
 			ctx.ui.notify(`unified-exec: terminated ${drained.length} live session(s) on shutdown`, "info");
 		}
+	});
+
+	// Human-facing escape hatch: inspect and kill live sessions without going
+	// through the model.
+	pi.registerCommand("unified-exec-sessions", {
+		description: "List live unified-exec sessions and optionally kill one (or all)",
+		handler: async (_args, cmdCtx) => {
+			ctx.ui = cmdCtx.ui;
+			// Reap silently-exited sessions first so the picker only shows live ones.
+			for (const s of ctx.store.values()) {
+				if (s.hasExited) removeSession(ctx, s.id);
+			}
+			updateRunningSessionsUi(ctx);
+			const sessions = runningSessions(ctx);
+			if (sessions.length === 0) {
+				cmdCtx.ui.notify("unified-exec: no live sessions", "info");
+				return;
+			}
+			const now = Date.now();
+			const labels = sessions.map(
+				(s) => `#${s.id} ${formatElapsed(now - s.startedAt)} ${oneLineCommand(s.displayCommand, 60)}`,
+			);
+			const KILL_ALL = `Kill all ${sessions.length} ${plural(sessions.length, "session")}`;
+			const choice = await cmdCtx.ui.select(
+				`unified-exec: ${sessions.length} live ${plural(sessions.length, "session")} — select to kill (Esc to cancel)`,
+				[...labels, KILL_ALL],
+			);
+			if (!choice) return;
+			const targets = choice === KILL_ALL ? sessions : sessions.filter((s) => choice.startsWith(`#${s.id} `));
+			let killed = 0;
+			for (const s of targets) {
+				const outcome = await terminateSessionById(ctx, s.id, "SIGTERM");
+				if (outcome) killed++;
+			}
+			updateRunningSessionsUi(ctx);
+			cmdCtx.ui.notify(`unified-exec: killed ${killed} ${plural(killed, "session")}`, "info");
+		},
 	});
 
 	// ---------------- Tools ----------------
@@ -802,41 +921,16 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
 			const sid = (params as { session_id: number; signal?: string }).session_id;
-			const initial = ((params as any).signal as NodeJS.Signals | undefined) ?? "SIGTERM";
-			const session = ctx.store.get(sid);
-			if (!session) {
+			const initial = normalizeSignal((params as { signal?: string }).signal);
+			const outcome = await terminateSessionById(ctx, sid, initial);
+			if (!outcome) {
 				return {
 					content: [{ type: "text", text: `No such session: ${sid}` }],
 					details: { session_id: sid, found: false },
 				};
 			}
-			const start = Date.now();
-			session.kill(initial);
-			// Wait up to 2s for exit.
-			const exitDeadline = start + 2000;
-			while (!session.hasExited && Date.now() < exitDeadline) {
-				await sleep(50);
-			}
-			let escalated = false;
-			if (!session.hasExited) {
-				session.kill("SIGKILL");
-				escalated = true;
-				const kdeadline = Date.now() + 500;
-				while (!session.hasExited && Date.now() < kdeadline) {
-					await sleep(25);
-				}
-			}
-			// Final drain.
-			const collected = await collectOutputUntilDeadline({
-				buffer: session.outputBuffer,
-				outputNotify: session.outputNotify,
-				outputClosed: session.outputClosed,
-				exited: session.exited,
-				deadlineMs: Date.now() + 100,
-			});
-			removeSession(ctx, sid);
+			const { session, escalated, finalOutput: text } = outcome;
 			updateRunningSessionsUi(ctx);
-			const text = decode(collected);
 			const details = {
 				session_id: sid,
 				final_output: text,
@@ -866,36 +960,53 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, _params, _signal, _onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
 			// Reap any sessions that have exited silently (e.g., completed between
-			// tool calls without anyone observing them). This mirrors codex's
-			// `refresh_process_state` filter when enumerating live processes.
+			// tool calls without anyone observing them) — but report each of them
+			// one final time with exit info instead of dropping them on the floor.
+			// This mirrors codex's `refresh_process_state` filter while preserving
+			// our "exit information is never silently lost" guarantee.
+			const reaped: ExecSession[] = [];
 			for (const s of ctx.store.values()) {
-				if (s.hasExited) removeSession(ctx, s.id);
+				if (s.hasExited) {
+					removeSession(ctx, s.id);
+					reaped.push(s);
+				}
 			}
 			updateRunningSessionsUi(ctx);
 			const now = Date.now();
-			const sessions = ctx.store.values().map((s) => ({
-				session_id: s.id,
-				command: s.displayCommand,
-				cwd: s.cwd,
-				tty: s.tty,
-				pid: s.pid,
-				started_at_ms: s.startedAt,
-				elapsed_ms: now - s.startedAt,
-				running: !s.hasExited,
-				output_bytes_total: s.totalBytesSeen,
-				log_path: s.logPath,
-			}));
+			const live = ctx.store.values();
+			const sessions = [...live, ...reaped]
+				.sort((a, b) => a.id - b.id)
+				.map((s) => ({
+					session_id: s.id,
+					command: s.displayCommand,
+					cwd: s.cwd,
+					tty: s.tty,
+					pid: s.pid,
+					started_at_ms: s.startedAt,
+					elapsed_ms: now - s.startedAt,
+					running: !s.hasExited,
+					exit_code: s.hasExited ? s.exitCode : undefined,
+					signal: s.hasExited ? (s.signal ?? undefined) : undefined,
+					failure_message: s.failureMessage ?? undefined,
+					output_bytes_total: s.totalBytesSeen,
+					log_path: s.logPath,
+				}));
 			const lines = sessions.length
-				? sessions.map(
-						(s) =>
-							`  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
-								s.tty ? "tty" : "pipe"
-							}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}  ${s.command.length > 60 ? s.command.slice(0, 60) + "…" : s.command}\n        log: ${s.log_path}`,
-					)
+				? sessions.map((s) => {
+						const exitedSuffix = s.running
+							? ""
+							: `  [exited${s.exit_code !== undefined && s.exit_code !== null ? ` exit_code=${s.exit_code}` : ""}${s.signal ? ` signal=${s.signal}` : ""}; removed from store]`;
+						return `  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
+							s.tty ? "tty" : "pipe"
+						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}  ${s.command.length > 60 ? s.command.slice(0, 60) + "…" : s.command}${exitedSuffix}\n        log: ${s.log_path}`;
+					})
 				: ["  (no live sessions)"];
+			const header = reaped.length
+				? `unified-exec sessions (${live.length} live, ${reaped.length} just exited):`
+				: `unified-exec sessions (${live.length}):`;
 			return {
-				content: [{ type: "text", text: `unified-exec sessions (${sessions.length}):\n${lines.join("\n")}` }],
-				details: { sessions, active_count: sessions.length },
+				content: [{ type: "text", text: `${header}\n${lines.join("\n")}` }],
+				details: { sessions, active_count: live.length },
 			};
 		},
 	});

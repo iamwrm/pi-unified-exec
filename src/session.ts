@@ -109,9 +109,11 @@ export class ExecSession {
 			closeSync(openSync(self.logPath, "w"));
 			self.logStream = createWriteStream(self.logPath, { flags: "a" });
 			self.logStream.on("error", (err) => {
-				// Fatal log-stream error (disk full, permissions, etc.). We keep
-				// the session alive but stop mirroring further writes.
-				self.markFailure(`log stream error: ${err?.message ?? err}`);
+				// Log-stream error (disk full, permissions, etc.). The child is
+				// still running: record the failure and stop mirroring writes, but
+				// do NOT mark the session exited — that would make it unkillable
+				// (kill() no-ops once hasExited) and orphan the process.
+				self.recordFailure(`log stream error: ${err?.message ?? err}`);
 				self.logStream = undefined;
 			});
 		} catch (err: any) {
@@ -152,12 +154,12 @@ export class ExecSession {
 			self.outputNotify.notifyAll();
 		});
 
-		self.child.onExit((exitCode, signal) => {
+		self.child.onExit((exitCode, signal, failureMessage) => {
 			self.state = {
 				hasExited: true,
 				exitCode,
 				signal,
-				failureMessage: self.state.failureMessage,
+				failureMessage: self.state.failureMessage ?? failureMessage ?? null,
 			};
 			self.exitedAc.abort();
 			self.notifyExitListeners();
@@ -208,6 +210,18 @@ export class ExecSession {
 		}
 	}
 
+	/**
+	 * Record a non-fatal failure (e.g. log mirroring broke) WITHOUT marking the
+	 * session exited. The child keeps running and stays controllable.
+	 */
+	private recordFailure(message: string): void {
+		this.state = {
+			...this.state,
+			failureMessage: this.state.failureMessage ?? message,
+		};
+	}
+
+	/** Mark the session as failed-and-exited. Only for spawn-time failures. */
 	private markFailure(message: string): void {
 		this.state = {
 			hasExited: true,
