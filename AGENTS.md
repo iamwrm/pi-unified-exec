@@ -2,7 +2,7 @@
 
 Whenever you edit code, docs, tests, or package metadata, update `Changelog.md` in the same change.
 
-If you want to inspect pi-mono's source code, git clone https://github.com/badlogic/pi-mono to ./local_data/pi-mono
+If you want to inspect pi-mono's source code, git clone https://github.com/earendil-works/pi (formerly badlogic/pi-mono; old URL redirects) to ./local_data/pi-mono
 
 ./local_data is added in .gitignore.
 

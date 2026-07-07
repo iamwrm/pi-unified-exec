@@ -2,6 +2,46 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-07 — 0.5.0
+
+### Changed
+
+- **Migrated to the `@earendil-works/*` package scope**: upstream pi renamed
+  `@mariozechner/pi-coding-agent` / `@mariozechner/pi-tui` to
+  `@earendil-works/pi-coding-agent` / `@earendil-works/pi-tui` in 0.74.0 (the
+  old npm scope is frozen at 0.73.1; the repo moved to `earendil-works/pi`).
+  All imports in `src/` and `tests/`, both peerDependencies, and both dev pins
+  now use the new scope. Pi's extension loader still aliases the old scope at
+  runtime, but that compat shim is slated for removal upstream. Bumped the
+  package version to 0.5.0 because the peer dependency names changed.
+- **Dev pins bumped 0.73.0 → 0.80.3** (`@earendil-works/pi-coding-agent`,
+  `@earendil-works/pi-tui`).
+- Updated `README.md`, `docs/DEV.md`, and `AGENTS.md` references (package
+  scope, changelog/clone URLs → `earendil-works/pi`).
+
+### Verified
+
+- **Upstream compatibility with `@earendil-works/pi-coding-agent` 0.80.3**:
+  audited every release note from 0.73.0 to 0.80.3. Our entire import surface
+  (`ExtensionAPI`, `ExtensionContext`, `AgentToolResult`,
+  `ToolRenderResultOptions`, `Theme`, `TruncationResult`, `formatSize`,
+  `truncateTail`, `truncateToVisualLines`, `DEFAULT_MAX_BYTES`,
+  `DEFAULT_MAX_LINES`; pi-tui `Container`, `Text`, `truncateToWidth`,
+  `Component`) is unchanged. The only breaking changes upstream were the
+  minimum Node bump to 22.19.0 (0.75.0, dev-only impact) and the pi-ai root
+  API move to `/compat` (0.80.0, we don't import pi-ai). `npx tsc --noEmit`
+  clean; all 129 tests pass.
+
+### Fixed
+
+- **Test pins updated for new `truncateTail` line-counting semantics**:
+  since pi ≥ 0.80, a trailing `\n` no longer counts a phantom empty last line
+  and empty input counts 0 lines (previously `"".split("\n") → [""]` counted
+  1). Updated `tests/truncate.test.ts` and the `totalLines` expectations in
+  `tests/e2e.test.ts` (4001→4000, 2501→2500). No production-code change was
+  needed — the `[Showing lines X-Y of Z]` marker in `src/index.ts` derives
+  from the same counts and is now more accurate.
+
 ## 2026-06-10 — 0.4.0
 
 ### Fixed

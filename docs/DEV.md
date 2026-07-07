@@ -63,7 +63,7 @@ sibling view, indexed by concern:
 | The yield-until-deadline loop | `src/collect.ts` + `src/notify.ts` |
 | In-memory drain buffer | `src/head-tail-buffer.ts` |
 | On-disk log file mirroring | `src/session.ts` (`logStream`) |
-| Tail truncation for the LLM | `truncateTail` imported from `@mariozechner/pi-coding-agent` |
+| Tail truncation for the LLM | `truncateTail` imported from `@earendil-works/pi-coding-agent` |
 | C-style escape decoding for `chars` | `src/unescape.ts` |
 | PTY vs pipe spawning | `src/pty.ts` |
 | TUI renderCall / renderResult | `src/render.ts` |
@@ -214,7 +214,7 @@ won't affect tests. Verify via the tmux recipe above.
 
 ## Checking upstream compatibility
 
-Every time `@mariozechner/pi-coding-agent` (the host "pi" CLI) cuts a
+Every time `@earendil-works/pi-coding-agent` (the host "pi" CLI) cuts a
 release, our extension might break silently. The 6-step recipe below
 turns a version bump into a 5-minute audit instead of a "why did my
 tools stop rendering" debugging session. Record the result in
@@ -224,16 +224,20 @@ work.
 ### 1. Read the upstream changelog
 
 Source of truth:
-[`packages/coding-agent/CHANGELOG.md`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md).
+[`packages/coding-agent/CHANGELOG.md`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/CHANGELOG.md).
+(The repo moved from `badlogic/pi-mono` to `earendil-works/pi`; old URLs
+redirect but prefer the new ones. Package scope moved from
+`@mariozechner/*` to `@earendil-works/*` in 0.74.0 — the old npm scope is
+frozen at 0.73.1.)
 
 Fetch it and stop at the version we're pinned to so you only see
 entries that are newer than ours:
 
 ```bash
-CURRENT=$(npm pkg get devDependencies.'@mariozechner/pi-coding-agent' | tr -d '"')
+CURRENT=$(npm pkg get devDependencies.'@earendil-works/pi-coding-agent' | tr -d '"')
 echo "pinned to $CURRENT"
 
-curl -sL https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/CHANGELOG.md \
+curl -sL https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/CHANGELOG.md \
   | awk -v v="$CURRENT" '/^## \[/ { if (index($0, "[" v "]")) exit } { print }'
 ```
 
@@ -256,7 +260,7 @@ compaction, hooks, and HTML export — we don't use any of them.
 Confirm what we actually consume:
 
 ```bash
-grep -rh 'from "@mariozechner/pi-coding-agent' src/ | sort -u
+grep -rh 'from "@earendil-works/pi-coding-agent' src/ | sort -u
 ```
 
 As of 2026-04-21 the surface is:
@@ -280,8 +284,8 @@ step 3 to confirm.
 The surest test is to bump locally and let TypeScript tell us:
 
 ```bash
-npm install --save-dev @mariozechner/pi-coding-agent@<new-version> \
-                         @mariozechner/pi-tui@<new-version>
+npm install --save-dev @earendil-works/pi-coding-agent@<new-version> \
+                         @earendil-works/pi-tui@<new-version>
 npx tsc --noEmit
 ```
 
@@ -290,7 +294,7 @@ errors, grep the installed declarations to find the new shape:
 
 ```bash
 grep -rn 'getActiveTools\|setActiveTools\|SessionShutdownEvent' \
-  node_modules/@mariozechner/pi-coding-agent/dist/core/extensions/types.d.ts
+  node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts
 ```
 
 ### 4. Run the full test suite
@@ -313,7 +317,7 @@ Add an entry under today's date even when nothing had to change:
 
 ### Verified
 
-- **Upstream compatibility with `@mariozechner/pi-coding-agent` X.Y.Z**:
+- **Upstream compatibility with `@earendil-works/pi-coding-agent` X.Y.Z**:
   <one sentence summary of what changed upstream and why it doesn't
   affect us, or what we had to change if it did>.
 ```
@@ -326,8 +330,8 @@ zero.
 If steps 1–4 pass, bump both dev pins in `package.json` and commit:
 
 ```bash
-npm install --save-dev @mariozechner/pi-coding-agent@<new-version> \
-                         @mariozechner/pi-tui@<new-version>
+npm install --save-dev @earendil-works/pi-coding-agent@<new-version> \
+                         @earendil-works/pi-tui@<new-version>
 npx tsc --noEmit && npx tsx --test tests/*.test.ts
 git add package.json package-lock.json Changelog.md
 git commit -m "unified-exec: verify compat with pi-coding-agent <new-version>"
@@ -447,9 +451,9 @@ prior commits gives a sense of scope.
   semantics:
   [`codex-rs/core/src/unified_exec/`](https://github.com/openai/codex/tree/main/codex-rs/core/src/unified_exec)
 - Pi's built-in `bash` tool is the reference for output retention:
-  `@mariozechner/pi-coding-agent/dist/core/tools/bash.js` (locally
+  `@earendil-works/pi-coding-agent/dist/core/tools/bash.js` (locally
   installed in `node_modules/`).
 - Pi's extension API docs:
-  `@mariozechner/pi-coding-agent/docs/extensions.md`.
+  `@earendil-works/pi-coding-agent/docs/extensions.md`.
 
 Both source trees are worth keeping open in split panes while you work.

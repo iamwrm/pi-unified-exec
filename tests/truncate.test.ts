@@ -1,5 +1,5 @@
 /**
- * Unit tests for truncateTail — re-exported from `@mariozechner/pi-coding-agent`.
+ * Unit tests for truncateTail — re-exported from `@earendil-works/pi-coding-agent`.
  *
  * These tests pin the behavior we depend on. If pi-coding-agent ever
  * changes truncation semantics in a way that breaks unified-exec, these
@@ -8,7 +8,7 @@
 
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "@mariozechner/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "@earendil-works/pi-coding-agent";
 
 describe("truncateTail", () => {
 	it("passes short content through untouched", () => {
@@ -16,8 +16,8 @@ describe("truncateTail", () => {
 		assert.equal(r.truncated, false);
 		assert.equal(r.truncatedBy, null);
 		assert.equal(r.content, "hello\nworld\n");
-		assert.equal(r.totalLines, 3); // "hello", "world", ""
-		assert.equal(r.outputLines, 3);
+		assert.equal(r.totalLines, 2); // "hello", "world" — trailing \n does not count an empty line (pi >= 0.80)
+		assert.equal(r.outputLines, 2);
 		assert.equal(r.lastLinePartial, false);
 	});
 
@@ -64,11 +64,11 @@ describe("truncateTail", () => {
 
 	it("respects custom maxLines", () => {
 		const text = "a\nb\nc\nd\ne\n";
-		// split → ["a","b","c","d","e",""] (6 entries). Keep last 2 → ["e", ""] → "e\n".
+		// lines → ["a","b","c","d","e"] (trailing \n dropped, pi >= 0.80). Keep last 2 → "d\ne".
 		const r = truncateTail(text, { maxLines: 2 });
 		assert.equal(r.truncated, true);
 		assert.equal(r.truncatedBy, "lines");
-		assert.equal(r.content, "e\n");
+		assert.equal(r.content, "d\ne");
 		assert.equal(r.outputLines, 2);
 	});
 
@@ -95,7 +95,7 @@ describe("truncateTail", () => {
 		assert.equal(r.truncated, false);
 		assert.equal(r.content, "");
 		assert.equal(r.totalBytes, 0);
-		assert.equal(r.totalLines, 1); // "".split("\n") === [""]
+		assert.equal(r.totalLines, 0); // empty input counts zero lines (pi >= 0.80)
 	});
 
 	it("handles UTF-8 multibyte chars cleanly", () => {

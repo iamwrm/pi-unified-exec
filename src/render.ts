@@ -17,8 +17,8 @@ import {
 	type ToolDefinition,
 	type ToolRenderResultOptions,
 	truncateToVisualLines,
-} from "@mariozechner/pi-coding-agent";
-import { Container, Text, truncateToWidth, type Component } from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-coding-agent";
+import { Container, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 
 type ExportedRenderCall<TState> = NonNullable<ToolDefinition<any, any, TState>["renderCall"]>;
 type ToolRenderContext<TState = any, TArgs = any> = Parameters<ExportedRenderCall<TState>>[2] & {

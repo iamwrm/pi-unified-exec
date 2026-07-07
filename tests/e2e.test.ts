@@ -510,7 +510,7 @@ describe("unified-exec e2e", () => {
 		assert.ok(bytes <= 60 * 1024, `LLM-visible output should be <=60KB; got ${bytes}`);
 		assert.ok(bytes > 40 * 1024, `LLM-visible output should be close to 50KiB; got ${bytes}`);
 		assert.equal(r.details.truncation.truncatedBy, "bytes");
-		assert.equal(r.details.truncation.totalLines, 4001); // 4000 lines + trailing empty
+		assert.equal(r.details.truncation.totalLines, 4000); // trailing \n does not count an empty line (pi >= 0.80)
 
 		// The rendered text (what actually goes to the LLM) includes the marker.
 		const rendered = r.content[0].text;
@@ -539,7 +539,7 @@ describe("unified-exec e2e", () => {
 		assert.ok(r.details.truncation, `expected truncation metadata`);
 		assert.equal(r.details.truncation.truncatedBy, "lines");
 		assert.equal(r.details.truncation.outputLines, 2000);
-		assert.equal(r.details.truncation.totalLines, 2501); // trailing newline adds empty
+		assert.equal(r.details.truncation.totalLines, 2500); // trailing \n does not count an empty line (pi >= 0.80)
 		// Marker lives in the rendered content text, not in details.output.
 		assert.ok(r.content[0].text.includes("Showing lines"));
 		await h.emit("session_shutdown");

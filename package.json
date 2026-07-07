@@ -1,6 +1,6 @@
 {
 	"name": "pi-unified-exec",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "Codex-style unified_exec for pi: long-lived shell sessions the LLM polls and drives with write_stdin (Ctrl-C, arrow keys, PTY, REPLs, ssh, dev servers). Full output logged to disk.",
 	"keywords": [
 		"pi-package",
@@ -35,16 +35,16 @@
 		"access": "public"
 	},
 	"peerDependencies": {
-		"@mariozechner/pi-coding-agent": "*",
-		"@mariozechner/pi-tui": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
 	"optionalDependencies": {
 		"node-pty-prebuilt-multiarch": "0.10.1-pre.5"
 	},
 	"devDependencies": {
-		"@mariozechner/pi-coding-agent": "0.73.0",
-		"@mariozechner/pi-tui": "0.73.0",
+		"@earendil-works/pi-coding-agent": "0.80.3",
+		"@earendil-works/pi-tui": "0.80.3",
 		"@types/node": "^22.0.0",
 		"tsx": "^4.19.0",
 		"typebox": "1.1.24",

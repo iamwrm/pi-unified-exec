@@ -510,7 +510,7 @@ completion and never revisit the log, it'll linger until your next reboot.
 | `src/session.ts` | `codex-rs/core/src/unified_exec/process.rs::UnifiedExecProcess` |
 | `src/session-store.ts` | `codex-rs/core/src/unified_exec/process_manager.rs::ProcessStore` |
 | `src/pty.ts` | `codex-rs/utils/pty` (pty.rs + pipe.rs) |
-| `truncateTail` from `@mariozechner/pi-coding-agent` | (no equivalent in codex) — pi bash's tail truncator |
+| `truncateTail` from `@earendil-works/pi-coding-agent` | (no equivalent in codex) — pi bash's tail truncator |
 | `src/unescape.ts` | (no equivalent in codex) — C-style escape decoder for `chars` |
 | `src/render.ts` | (no equivalent in codex) — pi TUI renderCall / renderResult |
 | `src/index.ts` exec_command handler | `codex-rs/core/src/tools/handlers/unified_exec.rs` |
