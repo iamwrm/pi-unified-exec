@@ -21,6 +21,9 @@
 	},
 	"homepage": "https://github.com/iamwrm/pi-unified-exec#readme",
 	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
 	"files": [
 		"src",
 		"README.md",

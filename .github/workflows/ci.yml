@@ -14,7 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        node: ["20", "22"]
+        # pi-coding-agent requires Node >= 22.19.0 (its bundled undici 8
+        # uses worker_threads.markAsUncloneable, absent on Node 20).
+        node: ["22", "24"]
 
     steps:
       - uses: actions/checkout@v6

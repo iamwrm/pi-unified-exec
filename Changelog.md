@@ -2,6 +2,17 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-08
+
+### Fixed
+
+- **CI failing on Node 20**: `@earendil-works/pi-coding-agent` requires
+  Node >= 22.19.0 (its bundled undici 8 calls
+  `worker_threads.markAsUncloneable`, which doesn't exist on Node 20, so four
+  test files crashed on import with `webidl.util.markAsUncloneable is not a
+  function`). Dropped Node 20 from the CI matrix in favor of 22 and 24, and
+  declared `"engines": { "node": ">=22.19.0" }` in `package.json`.
+
 ## 2026-07-07 — 0.5.0
 
 ### Changed
