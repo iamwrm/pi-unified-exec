@@ -628,10 +628,16 @@ describe("unified-exec e2e", () => {
 		// the failure instead of silently dropping the bytes.
 		const r3 = await h.call("write_stdin", { session_id: sid, chars: "again\n", yield_time_ms: 300 });
 		if (r3.details.session_id !== undefined) {
-			assert.ok(
-				typeof r3.details.failure_message === "string" && r3.details.failure_message.includes("stdin"),
-				`expected stdin failure note; got ${JSON.stringify(r3.details)}`,
-			);
+			// On Windows, writes to a pipe whose reader closed don't fail
+			// deterministically (bytes can sit in the pipe buffer without an
+			// error), so the failure note may legitimately never appear. The
+			// core guarantee — the host doesn't crash — holds either way.
+			if (!IS_WINDOWS) {
+				assert.ok(
+					typeof r3.details.failure_message === "string" && r3.details.failure_message.includes("stdin"),
+					`expected stdin failure note; got ${JSON.stringify(r3.details)}`,
+				);
+			}
 			await h.call("kill_session", { session_id: sid });
 		}
 		await h.emit("session_shutdown");
