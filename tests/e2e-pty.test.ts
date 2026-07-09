@@ -93,15 +93,19 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 				return;
 			}
 
+			// Submit with \r (the Enter key), not \n: POSIX ptys map CR→NL in
+			// canonical mode (ICRNL) so both work there, but legacy Windows
+			// console line input only executes on CR — with \n the REPL echoes
+			// the text without running it (observed on windows-latest CI).
 			const r2 = await h.call("write_stdin", {
 				session_id: sid,
-				chars: "print(2 + 40)\n",
+				chars: "print(2 + 40)\r",
 				yield_time_ms: 800,
 			});
 			assert.ok(r2.details.output.includes("42"), `got: ${r2.details.output}`);
 
 			// Quit.
-			await h.call("write_stdin", { session_id: sid, chars: "exit()\n", yield_time_ms: 1500 });
+			await h.call("write_stdin", { session_id: sid, chars: "exit()\r", yield_time_ms: 1500 });
 			// Clean up if still alive.
 			const list = await h.call("list_sessions", {});
 			if (list.details.sessions.some((s: any) => s.session_id === sid)) {

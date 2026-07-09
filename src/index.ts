@@ -892,6 +892,7 @@ export default function (pi: ExtensionAPI) {
 			`Prefer one long empty poll over many short polls to avoid filling the conversation with repeated partial output; for prompt-cache-sensitive runs, set ${MAX_EMPTY_POLL_ENV_VAR}=300000 to keep polls within typical 5-minute cache expiry windows.`,
 			"Use long empty polls for builds, test suites, installs, downloads, data processing, and other jobs that do not need interaction.",
 			"Do not use long polls for interactive sessions such as REPLs, sudo, ssh, password prompts, or commands where you may need to send input soon.",
+			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
 		parameters: Type.Object({

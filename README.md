@@ -525,6 +525,10 @@ Supported — both pipes and PTY mode:
 - Ctrl-C injection (`write_stdin chars="\x03"`) works in PTY mode — ConPTY
   translates it into a real console interrupt. In pipe mode it's just a byte,
   as on every platform.
+- **Submit tty input with `\r`, not `\n`.** POSIX terminals map CR→NL so
+  both work there, but legacy Windows console line input only executes on
+  CR — with `\n` a REPL echoes the text without running it.
+  `write_stdin chars="print(6*7)\r"` is portable; `\n` is not.
 
 ## Source map vs codex
 
