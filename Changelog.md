@@ -2,6 +2,42 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-09
+
+### Added
+
+- **Windows support** (fixes [#3](https://github.com/iamwrm/pi-unified-exec/issues/3)):
+  - **Process-tree kill via `taskkill /pid <pid> /T /F`**: POSIX
+    process-group kills (`process.kill(-pid)`) don't exist on Windows;
+    killing only the shell orphaned grandchildren, which also held the
+    stdio pipes open and delayed exit detection past the escalation
+    grace. Every kill path (`kill_session`, LRU eviction,
+    `session_shutdown`, `/unified-exec-sessions`) now force tree-kills on
+    Windows. Pipes are spawned with `detached: false` there (no process
+    groups to detach into).
+  - **Windows PTY (ConPTY)**: swapped the optional PTY dependency from
+    `node-pty-prebuilt-multiarch` (linux/macOS prebuilds only) to the
+    API-compatible `@homebridge/node-pty-prebuilt-multiarch` fork
+    (adds win32 prebuilds, covers Node 22/24 ABIs). The loader prefers
+    the new package and falls back to the old name. On Windows the PTY
+    binary is resolved to a full path (bare `bash` fails ConPTY's
+    "File not found" check), kills go through taskkill (node-pty's
+    `kill()` throws on signal names and its console-list helper crashes
+    on dead children), and ConPTY's conout worker thread + named-pipe
+    sockets are disposed on exit — they otherwise keep the host event
+    loop alive forever.
+  - **Shell selection** (new `src/shell.ts`): default shell is `bash`
+    everywhere; on Windows without bash on PATH it falls back to
+    `powershell` with a one-time warning. Explicit `shell: "cmd"` gets
+    `/d /s /c` + verbatim args (cmd's quoting rules), `powershell`/`pwsh`
+    get `-NoProfile -Command`, POSIX shells keep `-c`.
+  - **CI**: `windows-latest` added to the matrix. Platform-aware test
+    fixes: SIGTERM-trap escalation doesn't apply on Windows (first kill
+    is already final), Windows' signal table lacks
+    SIGPIPE/SIGUSR1/SIGUSR2, and the python3 REPL PTY test now probes for
+    a real interpreter (the WindowsApps Store stub stays alive without
+    being a REPL). New `tests/shell.test.ts` (9 scenarios).
+
 ## 2026-07-08
 
 ### Fixed

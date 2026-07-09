@@ -11,6 +11,7 @@ import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
+import { IS_WINDOWS } from "../src/shell.ts";
 
 interface ToolDef {
 	name: string;
@@ -98,6 +99,18 @@ describe("unified-exec e2e", () => {
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 300_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 1_800_000);
+	});
+
+	it("Windows: shell=powershell and shell=cmd get shell-appropriate flags", { skip: !IS_WINDOWS }, async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "Write-Output ps-ok", shell: "powershell", yield_time_ms: 20000 });
+		assert.ok(r1.details.output.includes("ps-ok"), `output=${r1.details.output}`);
+		assert.equal(r1.details.exit_code, 0);
+		const r2 = await h.call("exec_command", { cmd: "echo cmd-ok", shell: "cmd", yield_time_ms: 20000 });
+		assert.ok(r2.details.output.includes("cmd-ok"), `output=${r2.details.output}`);
+		assert.equal(r2.details.exit_code, 0);
+		await h.emit("session_shutdown");
 	});
 
 	it("short-lived command returns exit_code and no session_id", async () => {
@@ -293,7 +306,15 @@ describe("unified-exec e2e", () => {
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number");
 		const r2 = await h.call("kill_session", { session_id: sid });
-		assert.equal(r2.details.escalated, true, `details=${JSON.stringify(r2.details)}`);
+		if (IS_WINDOWS) {
+			// No POSIX signals on Windows: the initial "SIGTERM" is already a
+			// force tree-kill (taskkill /T /F), so no escalation is needed —
+			// the trap never matters. Just assert the session died.
+			assert.equal(r2.details.escalated, false, `details=${JSON.stringify(r2.details)}`);
+			assert.ok(r2.details.exit_code != null || r2.details.signal, `details=${JSON.stringify(r2.details)}`);
+		} else {
+			assert.equal(r2.details.escalated, true, `details=${JSON.stringify(r2.details)}`);
+		}
 		await h.emit("session_shutdown");
 	});
 

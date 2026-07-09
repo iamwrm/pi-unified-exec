@@ -41,6 +41,7 @@ import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
+import { buildShellCommand, IS_WINDOWS, resolveDefaultShell } from "./shell.ts";
 import { unescapeChars } from "./unescape.ts";
 
 // ---------------- Constants (mirror codex) ----------------
@@ -183,6 +184,7 @@ interface ExtensionCtx {
 	ui: ExtensionContext["ui"] | undefined;
 	widgetVisible: boolean;
 	exitUnsubscribers: Map<number, () => void>;
+	warnedShellFallback: boolean;
 }
 
 type ExecCommandArgs = {
@@ -235,25 +237,37 @@ async function runExecCommand(
 	const tty = args.tty ?? false;
 	if (tty && !isPtyAvailable()) {
 		throw new Error(
-			`tty: true requires node-pty-prebuilt-multiarch but it failed to load: ${getPtyLoadError() ?? "unknown"}.\n` +
+			`tty: true requires @homebridge/node-pty-prebuilt-multiarch but it failed to load: ${getPtyLoadError() ?? "unknown"}.\n` +
 				`Run:  cd .pi/extensions/unified-exec && npm install\n` +
 				`Or call with tty: false (default).`,
 		);
 	}
 
-	const shellBin = args.shell ?? "bash";
-	const command = [shellBin, "-c", args.cmd];
+	let shellBin = args.shell;
+	if (!shellBin) {
+		const resolved = resolveDefaultShell();
+		shellBin = resolved.shell;
+		if (resolved.fellBack && !ctx.warnedShellFallback) {
+			ctx.warnedShellFallback = true;
+			ctx.ui?.notify(
+				"unified-exec: bash not found on PATH; falling back to powershell. Install Git Bash for best results.",
+				"warning",
+			);
+		}
+	}
+	const shellCommand = buildShellCommand(shellBin, args.cmd);
 	const effectiveCwd = args.workdir && args.workdir.length > 0 ? args.workdir : cwd;
 	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_EXEC_YIELD_MS);
 
 	const id = ctx.store.allocateId();
 	const session = ExecSession.spawn(id, {
-		command,
+		command: shellCommand.command,
 		cwd: effectiveCwd,
 		env: process.env,
 		tty,
 		displayCommand: args.cmd,
 		shell: shellBin,
+		windowsVerbatimArguments: shellCommand.windowsVerbatimArguments,
 	});
 
 	if (session.failureMessage) {
@@ -724,6 +738,7 @@ export default function (pi: ExtensionAPI) {
 		ui: undefined,
 		widgetVisible: false,
 		exitUnsubscribers: new Map(),
+		warnedShellFallback: false,
 	};
 
 	// By default, unified-exec removes pi's built-in `bash` tool so the LLM
@@ -840,7 +855,12 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
 			workdir: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
-			shell: Type.Optional(Type.String({ description: "Shell binary. Defaults to bash." })),
+			shell: Type.Optional(
+				Type.String({
+					description:
+						"Shell binary. Defaults to bash (on Windows: bash if on PATH, else powershell). cmd and powershell/pwsh get shell-appropriate flags.",
+				}),
+			),
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a PTY. Default false (plain pipes)." })),
 			yield_time_ms: Type.Optional(
 				Type.Number({
@@ -910,7 +930,7 @@ export default function (pi: ExtensionAPI) {
 		name: "kill_session",
 		label: "kill_session",
 		description:
-			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s). Use when the process won't exit via Ctrl-C. session_id is invalid after.",
+			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after.",
 		promptSnippet: "Terminate a session",
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session to terminate." }),

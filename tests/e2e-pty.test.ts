@@ -4,9 +4,24 @@
  */
 
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { isPtyAvailable } from "../src/pty.ts";
+
+/**
+ * True when a real python3 exists. On Windows the "python3" on PATH may be
+ * the WindowsApps Store stub, which stays alive without being a REPL — so
+ * probe with --version instead of relying on spawn success.
+ */
+function hasRealPython3(): boolean {
+	try {
+		const r = spawnSync("python3", ["--version"], { timeout: 5000, windowsHide: true });
+		return r.status === 0;
+	} catch {
+		return false;
+	}
+}
 
 function makeHarness() {
 	const tools: Record<string, any> = {};
@@ -54,7 +69,7 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("write_stdin drives a Python REPL over PTY", async () => {
+	it("write_stdin drives a Python REPL over PTY", { skip: !hasRealPython3() }, async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		const r1 = await h.call("exec_command", {

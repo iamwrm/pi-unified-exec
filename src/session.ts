@@ -35,6 +35,7 @@ export interface SessionSpawnOptions {
 	streamTailBytes?: number;
 	displayCommand?: string; // human-readable command for list_sessions/UI
 	shell?: string; // raw `shell` arg recorded for introspection
+	windowsVerbatimArguments?: boolean; // Windows cmd.exe quoting (see shell.ts)
 }
 
 export interface SessionState {
@@ -131,6 +132,7 @@ export class ExecSession {
 				tty: opts.tty,
 				cols: opts.cols,
 				rows: opts.rows,
+				windowsVerbatimArguments: opts.windowsVerbatimArguments,
 			});
 		} catch (err: any) {
 			self.markFailure(err?.message ?? String(err));

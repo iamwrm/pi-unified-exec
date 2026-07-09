@@ -1,5 +1,5 @@
 /**
- * Unified spawn: PTY (via node-pty-prebuilt-multiarch) or plain pipes.
+ * Unified spawn: PTY (via @homebridge/node-pty-prebuilt-multiarch) or plain pipes.
  *
  * Presents a single `SpawnedChild` abstraction used by `session.ts` regardless
  * of underlying mode. Mirrors codex's `codex_utils_pty::pty` (tty=true) and
@@ -10,6 +10,8 @@ import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 
+import { findOnPath, IS_WINDOWS } from "./shell.ts";
+
 export interface SpawnOptions {
 	command: string[];
 	cwd: string;
@@ -17,6 +19,8 @@ export interface SpawnOptions {
 	tty: boolean;
 	cols?: number;
 	rows?: number;
+	/** Windows-only: pass args verbatim (needed for cmd.exe quoting). */
+	windowsVerbatimArguments?: boolean;
 }
 
 /**
@@ -73,6 +77,13 @@ type PtyProcess = {
 	kill: (signal?: string) => void;
 };
 
+/**
+ * PTY provider packages, in preference order. The @homebridge fork ships
+ * win32 prebuilds (conpty/winpty) in addition to linux/macOS; the original
+ * covers linux/macOS only. Both expose the same node-pty API.
+ */
+const PTY_PACKAGES = ["@homebridge/node-pty-prebuilt-multiarch", "node-pty-prebuilt-multiarch"];
+
 let ptyModule: PtyModule | null | undefined;
 let ptyLoadError: string | undefined;
 
@@ -88,15 +99,20 @@ export function isPtyAvailable(): boolean {
 
 function loadPty(): void {
 	if (ptyModule !== undefined) return; // already attempted
-	try {
-		// Use createRequire so CJS-only native modules work under ESM + jiti.
-		const req = createRequire(import.meta.url);
-		ptyModule = req("node-pty-prebuilt-multiarch") as PtyModule;
-		ptyLoadError = undefined;
-	} catch (err: any) {
-		ptyModule = null;
-		ptyLoadError = err?.message ?? String(err);
+	// Use createRequire so CJS-only native modules work under ESM + jiti.
+	const req = createRequire(import.meta.url);
+	const errors: string[] = [];
+	for (const pkg of PTY_PACKAGES) {
+		try {
+			ptyModule = req(pkg) as PtyModule;
+			ptyLoadError = undefined;
+			return;
+		} catch (err: any) {
+			errors.push(`${pkg}: ${err?.message ?? err}`);
+		}
 	}
+	ptyModule = null;
+	ptyLoadError = errors.join("; ");
 }
 
 // Numeric signal → name, built from the platform's full signal table so our
@@ -113,13 +129,51 @@ export function signalNameFromNumber(num: number): NodeJS.Signals | null {
 	return SIGNAL_NAMES[num] ?? null;
 }
 
+/**
+ * Windows: force-kill the whole process tree rooted at `pid`.
+ *
+ * There are no POSIX signals or process groups on Windows. Killing only the
+ * direct child (the shell) leaves grandchildren alive holding the stdio
+ * pipes open, which delays our `close` event indefinitely and orphans the
+ * subtree. `taskkill /T /F` terminates the full tree. Fire-and-forget: the
+ * child's `close` event is the source of truth for exit.
+ */
+function killWindowsTree(pid: number): void {
+	try {
+		const tk = cpSpawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		tk.on("error", () => {});
+	} catch {
+		// taskkill missing/unspawnable — nothing more we can do
+	}
+}
+
+/**
+ * Windows: node-pty's conpty connection holds a worker thread and named-pipe
+ * sockets that keep the Node event loop alive even after the child exits.
+ * Dispose them once the terminal is done, otherwise the host process (pi or
+ * the test runner) never exits. Best-effort: internals are undocumented.
+ */
+function disposeWindowsConpty(child: PtyProcess): void {
+	try {
+		const agent = (child as any)._agent;
+		agent?._inSocket?.destroy?.();
+		agent?._outSocket?.destroy?.();
+		agent?._conoutSocketWorker?.dispose?.();
+	} catch {
+		// best-effort cleanup
+	}
+}
+
 /** Spawn a child with PTY or pipes. Throws if PTY requested but unavailable. */
 export function spawnChild(opts: SpawnOptions): SpawnedChild {
 	if (opts.tty) {
 		loadPty();
 		if (!ptyModule) {
 			throw new Error(
-				`tty: true requires node-pty-prebuilt-multiarch, but it failed to load: ${ptyLoadError ?? "unknown error"}.\n` +
+				`tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${ptyLoadError ?? "unknown error"}.\n` +
 					`Install it with:  cd .pi/extensions/unified-exec && npm install\n` +
 					`Or call with tty: false to use pipes instead.`,
 			);
@@ -132,8 +186,14 @@ export function spawnChild(opts: SpawnOptions): SpawnedChild {
 // ---------------- PTY impl ----------------
 
 function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
-	const [file, ...args] = opts.command;
+	let [file, ...args] = opts.command;
 	if (!file) throw new Error("spawnChild: empty command");
+	// conpty needs a resolvable executable: bare "bash" fails with
+	// "File not found" while "bash.exe" or an absolute path works. Resolve
+	// PATH ourselves for names without a directory component.
+	if (IS_WINDOWS && !/[\\/]/.test(file)) {
+		file = findOnPath(file) ?? file;
+	}
 	const child = mod.spawn(file, args, {
 		cwd: opts.cwd,
 		env: opts.env,
@@ -171,6 +231,7 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 		}
 		exitHandlers.clear();
 		dataHandlers.clear();
+		if (IS_WINDOWS) setImmediate(() => disposeWindowsConpty(child));
 	});
 
 	return {
@@ -195,6 +256,14 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 		},
 		kill(signal = "SIGTERM") {
 			if (exited) return;
+			if (IS_WINDOWS) {
+				// Avoid WindowsTerminal.kill(): it throws when passed a signal
+				// name and its console-process-list helper crashes if the child
+				// is already gone. taskkill the tree instead; node-pty's exit
+				// event then fires and disposeWindowsConpty releases resources.
+				killWindowsTree(child.pid);
+				return;
+			}
 			try {
 				child.kill(signal);
 			} catch {
@@ -220,8 +289,12 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 	const child: ChildProcess = cpSpawn(file, args, {
 		cwd: opts.cwd,
 		env: opts.env,
-		detached: true, // own process group so we can `kill -pid`
+		// POSIX: own process group so we can `kill -pid` the whole tree.
+		// Windows has no process groups; we tree-kill via taskkill instead.
+		detached: !IS_WINDOWS,
 		stdio: ["pipe", "pipe", "pipe"],
+		windowsHide: true,
+		windowsVerbatimArguments: opts.windowsVerbatimArguments,
 	});
 
 	const dataHandlers = new Set<(chunk: Uint8Array) => void>();
@@ -294,6 +367,13 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 		},
 		kill(signal = "SIGTERM") {
 			if (exited || !child.pid) return;
+			if (IS_WINDOWS) {
+				// Windows has no graceful console signal we can deliver from
+				// here (taskkill without /F sends WM_CLOSE, which console apps
+				// ignore). Every signal maps to a force tree-kill.
+				killWindowsTree(child.pid);
+				return;
+			}
 			try {
 				process.kill(-child.pid, signal);
 			} catch {
