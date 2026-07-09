@@ -10,6 +10,7 @@ jobs:
   test:
     name: Test (Node ${{ matrix.node }} on ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -32,5 +33,13 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      # Run the PTY e2e file directly (not via --test) so per-test output
+      # streams live instead of being buffered until file completion — if
+      # something hangs, the log shows exactly which test.
+      - name: Test (PTY e2e, direct)
+        run: npx tsx tests/e2e-pty.test.ts
+        timeout-minutes: 5
+
       - name: Test
         run: npx tsx --test tests/*.test.ts
+        timeout-minutes: 10
