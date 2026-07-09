@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { isPtyAvailable } from "../src/pty.ts";
+import { IS_WINDOWS } from "../src/shell.ts";
 
 /**
  * True when a real python3 exists. On Windows the "python3" on PATH may be
@@ -88,10 +89,11 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 				yield_time_ms: 800,
 			});
 			const sid = r1.details.session_id;
-			if (typeof sid !== "number") {
-				// No python3? Skip silently.
-				return;
-			}
+			// hasRealPython3 already gated this test, so a missing session_id
+			// means the REPL exited or failed to spawn — a real failure, not
+			// "no python3".
+			assert.equal(typeof sid, "number", `REPL did not stay alive: ${JSON.stringify(r1.details)}`);
+			if (typeof sid !== "number") return; // for type narrowing
 
 			// Submit with \r (the Enter key), not \n: POSIX ptys map CR→NL in
 			// canonical mode (ICRNL) so both work there, but legacy Windows
@@ -111,6 +113,28 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 			if (list.details.sessions.some((s: any) => s.session_id === sid)) {
 				await h.call("kill_session", { session_id: sid });
 			}
+		} finally {
+			await h.emit("session_shutdown");
+		}
+	});
+
+	it("Windows: shell=cmd with tty:true works (verbatim /c payload)", { skip: !IS_WINDOWS }, async () => {
+		// Regression: node-pty's argsToCommandLine re-escapes embedded quotes,
+		// so array-args mangled the pre-quoted /s /c payload into
+		// `\"echo ...\"` — guaranteed "not recognized" failure. The PTY path
+		// must pass the args as a raw command-line string instead.
+		const h = makeHarness();
+		await h.emit("session_start");
+		try {
+			const r = await h.call("exec_command", {
+				cmd: "echo tty-one& echo tty-two",
+				shell: "cmd",
+				tty: true,
+				yield_time_ms: 20000,
+			});
+			assert.equal(r.details.exit_code, 0, JSON.stringify(r.details));
+			assert.ok(r.details.output.includes("tty-one"), `output=${r.details.output}`);
+			assert.ok(r.details.output.includes("tty-two"), `output=${r.details.output}`);
 		} finally {
 			await h.emit("session_shutdown");
 		}

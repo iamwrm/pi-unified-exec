@@ -4,6 +4,51 @@ All notable changes to this project. **Newest entries go on top.**
 
 ## 2026-07-09
 
+### Fixed (post-review)
+
+A multi-perspective code review of the Windows PR produced 17 confirmed
+findings; all majors and most minors addressed:
+
+- **`shell: "cmd"` with `tty: true` was broken**: node-pty has no
+  `windowsVerbatimArguments` and its `argsToCommandLine()` re-escapes
+  embedded quotes, mangling the pre-quoted `/s /c` payload into a
+  guaranteed syntax error (and diverging the executed command from the
+  displayed one). The PTY path now passes the args as a single raw
+  command-line string, which node-pty uses verbatim. Covered by a new
+  Windows PTY e2e test.
+- **PTY dependency load is now guarded in CI**: new `tests/pty-load.test.ts`
+  asserts `isPtyAvailable()` when `EXPECT_PTY=1` (set on all matrix legs),
+  so a prebuild failure is a red build instead of a silent skip of the
+  whole PTY suite. The dep is pinned exactly (`0.13.1`) since
+  `disposeWindowsConpty` relies on undocumented internals (now also locked
+  by a mock-agent unit test).
+- **Dropped the fallback `require("node-pty-prebuilt-multiarch")`**: the
+  old package name is no longer declared, so Node's resolution would walk
+  ancestor `node_modules` — a planted package could inject unaudited native
+  code. Only the declared @homebridge package is loaded.
+- **Shell resolution hardening**: `findOnPath` only accepts regular files
+  (a directory named `bash` no longer matches) and returns absolute paths;
+  bare shell names are resolved to their absolute PATH match before
+  spawning (Windows' CreateProcess checks the child's cwd — the
+  LLM-supplied workdir — before PATH); System32's WSL `bash.exe` stub is
+  excluded from the default-shell probe; resolutions are cached
+  (previously every Windows PTY spawn re-scanned PATH synchronously).
+- **Windows kill escalation removed**: the "SIGKILL escalation" was a
+  byte-identical second `taskkill /T /F` after a wasted 2 s poll; on
+  Windows the first kill is already final, so escalation is skipped.
+- **Real fallback-branch coverage**: `resolveDefaultShell` takes an
+  injectable env; tests drive both the bash-found and powershell-fallback
+  branches (plus caching) with synthetic PATH fixtures on every platform.
+  cmd.exe quoting is e2e-tested against `&`, embedded quotes, `%VAR%`,
+  parentheses, and pipes — the inputs the mechanism exists for.
+- **CI**: direct PTY diagnostic step scoped to Windows (was doubling the
+  slowest suite on all 6 legs). Removed a redundant SIGSEGV assertion and
+  a stale python3 silent-skip branch that could mask real REPL failures.
+
+Known limitation (documented, not fixed): `taskkill /T` cannot reach
+grandchildren once the direct child has exited — true group-kill semantics
+would need Windows Job Objects; tracked as a possible follow-up.
+
 ### Added
 
 - **Windows support** (fixes [#3](https://github.com/iamwrm/pi-unified-exec/issues/3)):

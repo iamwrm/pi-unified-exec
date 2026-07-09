@@ -10,7 +10,7 @@ import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 
-import { findOnPath, IS_WINDOWS } from "./shell.ts";
+import { IS_WINDOWS, resolveBinary } from "./shell.ts";
 
 export interface SpawnOptions {
 	command: string[];
@@ -56,7 +56,9 @@ export interface SpawnedChild {
 type PtyModule = {
 	spawn: (
 		file: string,
-		args: string[],
+		// Windows only: a string is used as the raw command line, bypassing
+		// node-pty's argsToCommandLine re-escaping.
+		args: string[] | string,
 		opts: {
 			name?: string;
 			cols?: number;
@@ -78,11 +80,13 @@ type PtyProcess = {
 };
 
 /**
- * PTY provider packages, in preference order. The @homebridge fork ships
- * win32 prebuilds (conpty/winpty) in addition to linux/macOS; the original
- * covers linux/macOS only. Both expose the same node-pty API.
+ * PTY provider package. The @homebridge fork of node-pty-prebuilt-multiarch
+ * ships win32 prebuilds (conpty/winpty) in addition to linux/macOS. Loaded
+ * strictly by this name — no fallback to the old package: Node's require
+ * walks ancestor node_modules, so a fallback name could load an unaudited
+ * native module planted in an enclosing project.
  */
-const PTY_PACKAGES = ["@homebridge/node-pty-prebuilt-multiarch", "node-pty-prebuilt-multiarch"];
+const PTY_PACKAGE = "@homebridge/node-pty-prebuilt-multiarch";
 
 let ptyModule: PtyModule | null | undefined;
 let ptyLoadError: string | undefined;
@@ -99,20 +103,15 @@ export function isPtyAvailable(): boolean {
 
 function loadPty(): void {
 	if (ptyModule !== undefined) return; // already attempted
-	// Use createRequire so CJS-only native modules work under ESM + jiti.
-	const req = createRequire(import.meta.url);
-	const errors: string[] = [];
-	for (const pkg of PTY_PACKAGES) {
-		try {
-			ptyModule = req(pkg) as PtyModule;
-			ptyLoadError = undefined;
-			return;
-		} catch (err: any) {
-			errors.push(`${pkg}: ${err?.message ?? err}`);
-		}
+	try {
+		// Use createRequire so CJS-only native modules work under ESM + jiti.
+		const req = createRequire(import.meta.url);
+		ptyModule = req(PTY_PACKAGE) as PtyModule;
+		ptyLoadError = undefined;
+	} catch (err: any) {
+		ptyModule = null;
+		ptyLoadError = `${PTY_PACKAGE}: ${err?.message ?? err}`;
 	}
-	ptyModule = null;
-	ptyLoadError = errors.join("; ");
 }
 
 // Numeric signal → name, built from the platform's full signal table so our
@@ -135,8 +134,14 @@ export function signalNameFromNumber(num: number): NodeJS.Signals | null {
  * There are no POSIX signals or process groups on Windows. Killing only the
  * direct child (the shell) leaves grandchildren alive holding the stdio
  * pipes open, which delays our `close` event indefinitely and orphans the
- * subtree. `taskkill /T /F` terminates the full tree. Fire-and-forget: the
- * child's `close` event is the source of truth for exit.
+ * subtree. `taskkill /T /F` terminates the tree rooted at `pid`. Fire-and-
+ * forget: the child's `close` event is the source of truth for exit.
+ *
+ * Limitation: /T enumerates children of a LIVE root — if the direct child
+ * already exited while a backgrounded grandchild lives on, taskkill finds
+ * nothing to kill. True group semantics would need a Job Object
+ * (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE); POSIX handles this case via
+ * process groups (`kill -pid` works after the leader exits).
  */
 function killWindowsTree(pid: number): void {
 	try {
@@ -156,9 +161,9 @@ function killWindowsTree(pid: number): void {
  * Dispose them once the terminal is done, otherwise the host process (pi or
  * the test runner) never exits. Best-effort: internals are undocumented.
  */
-function disposeWindowsConpty(child: PtyProcess): void {
+export function disposeWindowsConpty(child: unknown): void {
 	try {
-		const agent = (child as any)._agent;
+		const agent = (child as any)?._agent;
 		agent?._inSocket?.destroy?.();
 		agent?._outSocket?.destroy?.();
 		agent?._conoutSocketWorker?.dispose?.();
@@ -190,11 +195,16 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 	if (!file) throw new Error("spawnChild: empty command");
 	// conpty needs a resolvable executable: bare "bash" fails with
 	// "File not found" while "bash.exe" or an absolute path works. Resolve
-	// PATH ourselves for names without a directory component.
-	if (IS_WINDOWS && !/[\\/]/.test(file)) {
-		file = findOnPath(file) ?? file;
+	// PATH ourselves (cached) for names without a directory component.
+	if (IS_WINDOWS) {
+		file = resolveBinary(file);
 	}
-	const child = mod.spawn(file, args, {
+	// node-pty has no windowsVerbatimArguments; its argsToCommandLine()
+	// re-escapes embedded quotes, mangling cmd.exe's pre-quoted /s /c payload
+	// (`/c "echo hi"` becomes `/c \"echo hi\"` — guaranteed syntax error).
+	// Passing args as a single string makes node-pty use it verbatim.
+	const ptyArgs: string[] | string = IS_WINDOWS && opts.windowsVerbatimArguments ? args.join(" ") : args;
+	const child = mod.spawn(file, ptyArgs, {
 		cwd: opts.cwd,
 		env: opts.env,
 		cols: opts.cols ?? 120,

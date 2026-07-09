@@ -420,7 +420,7 @@ npm install
 npx tsx --test tests/*.test.ts
 ```
 
-139 tests across 11 files: HeadTailBuffer (direct port of codex's unit
+157 tests across 12 files: HeadTailBuffer (direct port of codex's unit
 tests), Notify/Gate/sleep, collectOutputUntilDeadline (10 scenarios incl.
 abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
 (ported from pi, 13 scenarios), unescapeChars (14 scenarios for
@@ -431,8 +431,12 @@ full e2e pipes (35+ scenarios incl. log-file retention, byte/line truncation,
 spawn-failure diagnostics, EPIPE safety, exited-session reporting, shutdown
 SIGKILL escalation, onUpdate streaming, and the `/unified-exec-sessions`
 command), PTY mode (3 scenarios: simple command, Python REPL drive, Ctrl-C
-injection), shell selection (9 scenarios: per-shell argv construction, PATH
-lookup, Windows bash→powershell fallback).
+injection, cmd.exe verbatim payload), shell selection (per-shell argv
+construction, PATH lookup with synthetic PATH fixtures, Windows
+bash→powershell fallback both branches, WSL-stub exclusion, binary
+resolution caching), PTY loader guard (EXPECT_PTY assertion so a prebuild
+load failure is a red build, ConPTY disposal mock), and cmd.exe quoting
+e2e (operators, embedded quotes, %VAR%, parentheses, pipes).
 
 CI runs the suite on ubuntu, macos, and windows runners.
 
@@ -510,10 +514,15 @@ Supported — both pipes and PTY mode:
 
 - **PTY (`tty: true`) uses ConPTY** via `@homebridge/node-pty-prebuilt-multiarch`
   (win32 prebuilds — no compilation).
-- **Default shell**: `bash` when found on PATH (Git Bash / MSYS2 / WSL);
-  otherwise falls back to `powershell` with a one-time warning. Explicit
-  `shell: "cmd"` (`/d /s /c`) and `shell: "powershell"` / `"pwsh"`
-  (`-NoProfile -Command`) are supported.
+- **Default shell**: `bash` when found on PATH (Git Bash / MSYS2);
+  otherwise falls back to `powershell` with a one-time warning. System32's
+  `bash.exe` (the WSL stub) is deliberately excluded from the probe — it
+  runs commands inside a WSL distro's filesystem view, not Windows'.
+  Explicit `shell: "cmd"` (`/d /s /c`, verbatim command line — works in
+  both pipe and tty mode) and `shell: "powershell"` / `"pwsh"`
+  (`-NoProfile -Command`) are supported. Bare shell names are resolved to
+  their absolute PATH match before spawning, so a binary planted in an
+  untrusted workdir can't shadow the real shell.
 - **No POSIX signals.** Every kill — `kill_session`, `/unified-exec-sessions`,
   LRU eviction, `session_shutdown` — is a force tree-kill
   (`taskkill /pid <pid> /T /F`), regardless of the requested signal name.

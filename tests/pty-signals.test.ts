@@ -27,7 +27,6 @@ describe("signalNameFromNumber", () => {
 			if (num === undefined) continue;
 			assert.equal(signalNameFromNumber(num), name);
 		}
-		assert.equal(signalNameFromNumber(constants.signals.SIGSEGV), "SIGSEGV");
 	});
 
 	it("returns null for unknown numbers", () => {

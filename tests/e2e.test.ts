@@ -113,6 +113,30 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
+	it("Windows: cmd.exe quoting survives operators, quotes, %VAR%, parens", { skip: !IS_WINDOWS }, async () => {
+		// These are exactly the inputs the /d /s /c "<cmd>" + verbatim-args
+		// mechanism exists for; `echo simple` would pass even if it broke.
+		const h = makeHarness();
+		await h.emit("session_start");
+		const cases: Array<{ cmd: string; expect: string[] }> = [
+			{ cmd: "echo one& echo two", expect: ["one", "two"] }, // & separator
+			{ cmd: 'echo "a & b"', expect: ['"a & b"'] }, // quoted & is literal
+			{ cmd: "echo %OS%", expect: ["Windows_NT"] }, // env expansion
+			{ cmd: "(echo grouped)", expect: ["grouped"] }, // parentheses
+			// findstr, not find: Git Bash environments often shadow Windows'
+			// find.exe with GNU find earlier on PATH.
+			{ cmd: "echo piped-x | findstr piped", expect: ["piped-x"] }, // pipe
+		];
+		for (const { cmd, expect } of cases) {
+			const r = await h.call("exec_command", { cmd, shell: "cmd", yield_time_ms: 20000 });
+			assert.equal(r.details.exit_code, 0, `cmd=${cmd} details=${JSON.stringify(r.details)}`);
+			for (const e of expect) {
+				assert.ok(r.details.output.includes(e), `cmd=${cmd} expected "${e}" in output=${r.details.output}`);
+			}
+		}
+		await h.emit("session_shutdown");
+	});
+
 	it("short-lived command returns exit_code and no session_id", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
@@ -308,10 +332,16 @@ describe("unified-exec e2e", () => {
 		const r2 = await h.call("kill_session", { session_id: sid });
 		if (IS_WINDOWS) {
 			// No POSIX signals on Windows: the initial "SIGTERM" is already a
-			// force tree-kill (taskkill /T /F), so no escalation is needed —
-			// the trap never matters. Just assert the session died.
+			// force tree-kill (taskkill /T /F) and escalation is skipped (a
+			// second identical taskkill can't behave differently). Don't assert
+			// on exit timing (taskkill on a loaded runner can exceed the 2s
+			// window) — assert the session is gone from the store instead.
 			assert.equal(r2.details.escalated, false, `details=${JSON.stringify(r2.details)}`);
-			assert.ok(r2.details.exit_code != null || r2.details.signal, `details=${JSON.stringify(r2.details)}`);
+			const l = await h.call("list_sessions", {});
+			assert.ok(
+				!l.details.sessions.some((s: any) => s.session_id === sid && s.running),
+				`session ${sid} still listed as running: ${JSON.stringify(l.details)}`,
+			);
 		} else {
 			assert.equal(r2.details.escalated, true, `details=${JSON.stringify(r2.details)}`);
 		}

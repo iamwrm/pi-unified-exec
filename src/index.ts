@@ -41,7 +41,7 @@ import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
-import { buildShellCommand, IS_WINDOWS, resolveDefaultShell } from "./shell.ts";
+import { buildShellCommand, IS_WINDOWS, resolveBinary, resolveDefaultShell } from "./shell.ts";
 import { unescapeChars } from "./unescape.ts";
 
 // ---------------- Constants (mirror codex) ----------------
@@ -254,6 +254,11 @@ async function runExecCommand(
 				"warning",
 			);
 		}
+	} else if (IS_WINDOWS) {
+		// Resolve bare names to the absolute PATH match so the spawned binary
+		// is deterministic — Windows' CreateProcess checks the child's cwd
+		// (the LLM-supplied workdir) before PATH for bare names.
+		shellBin = resolveBinary(shellBin);
 	}
 	const shellCommand = buildShellCommand(shellBin, args.cmd);
 	const effectiveCwd = args.workdir && args.workdir.length > 0 ? args.workdir : cwd;
@@ -519,7 +524,10 @@ async function terminateSessionById(
 		await sleep(50);
 	}
 	let escalated = false;
-	if (!session.hasExited) {
+	// On Windows every kill is already a force tree-kill (taskkill /T /F);
+	// a "SIGKILL escalation" would spawn a byte-identical taskkill that
+	// cannot behave differently, so skip it there.
+	if (!session.hasExited && !IS_WINDOWS) {
 		session.kill("SIGKILL");
 		escalated = true;
 		const kdeadline = Date.now() + 500;
