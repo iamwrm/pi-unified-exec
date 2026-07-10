@@ -2,6 +2,38 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-10 — 0.6.1
+
+### Added
+
+- **Windows: find Git Bash even when it's not on PATH.** Git for Windows'
+  default installer option adds only `Git\cmd` (git.exe) to PATH — not
+  `Git\bin` — so the most common setup is "git works, bash doesn't", and
+  those users were silently downgraded to powershell. The default-shell
+  probe (and explicit `shell: "bash"`) now resolves in order:
+  1. `PI_UNIFIED_EXEC_BASH` env var (explicit override, must be a file)
+  2. `bash` on PATH (WSL System32 stub still excluded)
+  3. derived from `git.exe` on PATH — walk up from git's directory probing
+     `<root>\bin\bash.exe` (covers `Git\cmd`, `Git\bin`,
+     `Git\mingw64\bin` layouts)
+  4. well-known install roots: `%ProgramFiles%\Git`, `%ProgramW6432%\Git`,
+     `%ProgramFiles(x86)%\Git`, `%LocalAppData%\Programs\Git`
+  5. powershell fallback (warning now mentions `PI_UNIFIED_EXEC_BASH`)
+
+  Derived/fixed-path hits use `bin\bash.exe` (Git's launcher, which sets
+  up MSYS PATH so `ls`/`grep`/`sed` work in the child — verified with a
+  stripped PATH), never `usr\bin\bash.exe`. A one-time info notice reports
+  when bash is used from off PATH. Security posture unchanged: only
+  absolute paths under admin/user-owned install roots or the tree of an
+  already-PATH-trusted git.exe are probed; every candidate must be a
+  regular file; nothing cwd-relative. Registry lookup and MSYS2/Cygwin
+  roots deliberately omitted.
+
+### Fixed
+
+- De-flaked the three running-session UI tests (fixed sleeps → polling):
+  `sleep 0.4` exceeded the 700 ms wait on a loaded windows-latest runner.
+
 ## 2026-07-10
 
 ### Fixed (second review round)

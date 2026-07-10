@@ -8,7 +8,7 @@
  */
 
 import { statSync } from "node:fs";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 export const IS_WINDOWS = process.platform === "win32";
 
@@ -27,6 +27,15 @@ const WINDOWS_SHELL_EXTS = [".com", ".exe"];
 function system32(...parts: string[]): string {
 	const root = process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows";
 	return join(root, "System32", ...parts);
+}
+
+/** statSync().isFile() that never throws. */
+function isFile(p: string): boolean {
+	try {
+		return statSync(p).isFile();
+	} catch {
+		return false;
+	}
 }
 
 export interface ShellCommand {
@@ -99,11 +108,7 @@ export function findOnPath(
 			// cwd-dependent result that breaks when spawned from another cwd.
 			const full = resolve(dir, bin + ext);
 			if (opts.exclude?.test(full)) continue;
-			try {
-				if (statSync(full).isFile()) return full;
-			} catch {
-				// missing or unreadable — keep scanning
-			}
+			if (isFile(full)) return full;
 		}
 	}
 	return undefined;
@@ -114,10 +119,76 @@ export interface DefaultShell {
 	shell: string;
 	/** true when Windows had no usable bash and we fell back to powershell. */
 	fellBack: boolean;
+	/** How bash was located (absent when fellBack or on POSIX). */
+	bashSource?: BashSource;
 }
 
 /** System32's bash.exe is the WSL stub — a different OS view entirely. */
 const SYSTEM32_RE = /[\\/]system32[\\/]/i;
+
+/** How a Windows bash was located (drives the one-time "off PATH" notice). */
+export type BashSource = "env" | "path" | "git-derived" | "install-root";
+
+export interface WindowsBash {
+	path: string;
+	source: BashSource;
+}
+
+/**
+ * Locate a usable Git Bash on Windows, beyond plain PATH lookup.
+ *
+ * Git for Windows' default installer option puts only `Git\cmd` (git.exe)
+ * on PATH — not `Git\bin` — so the very common setup is "git works, bash
+ * doesn't". Resolution order:
+ *   1. PI_UNIFIED_EXEC_BASH env var (explicit override)
+ *   2. bash on PATH (excluding the System32 WSL stub)
+ *   3. derived from git.exe on PATH: walk up from git's dir probing
+ *      <root>\bin\bash.exe (covers Git\cmd, Git\bin, Git\mingw64\bin)
+ *   4. well-known install roots (%ProgramFiles%\Git, %ProgramW6432%\Git,
+ *      %ProgramFiles(x86)%\Git, %LocalAppData%\Programs\Git)
+ *
+ * Derived/fixed-path hits use `bin\bash.exe` (Git's launcher, which sets up
+ * MSYS PATH so ls/grep/sed work in the child) — never usr\bin\bash.exe,
+ * which spawns a bash without coreutils on PATH. Only absolute paths under
+ * admin/user-owned install roots or the tree of an already-PATH-trusted
+ * git.exe are probed; never anything cwd-relative.
+ */
+export function findWindowsBash(env: NodeJS.ProcessEnv): WindowsBash | undefined {
+	// 1. Explicit override.
+	const override = env.PI_UNIFIED_EXEC_BASH?.trim();
+	if (override && isFile(override)) return { path: override, source: "env" };
+
+	// 2. Plain PATH.
+	const onPath = findOnPath("bash", env, { exts: WINDOWS_SHELL_EXTS, exclude: SYSTEM32_RE });
+	if (onPath) return { path: onPath, source: "path" };
+
+	// 3. Derive from git.exe on PATH.
+	const git = findOnPath("git", env, { exts: WINDOWS_SHELL_EXTS, exclude: SYSTEM32_RE });
+	if (git) {
+		let dir = dirname(git); // e.g. <root>\cmd or <root>\mingw64\bin
+		for (let i = 0; i < 3; i++) {
+			const candidate = join(dir, "bin", "bash.exe");
+			if (isFile(candidate)) return { path: candidate, source: "git-derived" };
+			const parent = dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	}
+
+	// 4. Well-known install roots.
+	const roots = [
+		env.ProgramFiles && join(env.ProgramFiles, "Git"),
+		env.ProgramW6432 && join(env.ProgramW6432, "Git"),
+		env["ProgramFiles(x86)"] && join(env["ProgramFiles(x86)"], "Git"),
+		env.LOCALAPPDATA && join(env.LOCALAPPDATA, "Programs", "Git"),
+	];
+	for (const root of roots) {
+		if (!root) continue;
+		const candidate = join(root, "bin", "bash.exe");
+		if (isFile(candidate)) return { path: candidate, source: "install-root" };
+	}
+	return undefined;
+}
 
 /**
  * The Windows default-shell probe: prefer a real bash (Git Bash / MSYS2),
@@ -130,8 +201,8 @@ export function probeWindowsDefaultShell(
 	env: NodeJS.ProcessEnv,
 	exts: string[] = WINDOWS_EXEC_EXTS,
 ): DefaultShell {
-	const bash = findOnPath("bash", env, { exts, exclude: SYSTEM32_RE });
-	if (bash) return { shell: bash, fellBack: false };
+	const bash = findWindowsBash(env);
+	if (bash) return { shell: bash.path, fellBack: false, bashSource: bash.source };
 	const powershell = findOnPath("powershell", env, { exts });
 	// Last resort: the canonical absolute location, never a bare name — a
 	// bare name would let Windows' cwd-first lookup execute a
@@ -193,10 +264,18 @@ export function resolveWindowsShell(bin: string, env?: NodeJS.ProcessEnv): strin
 		const cached = resolvedBinaryCache.get(`shell:${bin}`);
 		if (cached) return cached;
 	}
-	const found = findOnPath(bin, env ?? process.env, { exts: WINDOWS_SHELL_EXTS });
+	const effectiveEnv = env ?? process.env;
+	// bash gets the extended probe (PATH → git-derived → install roots) so
+	// explicit shell:"bash" works on the common "git on PATH, bash not" setup.
+	const isBash = bin.replace(/\.(exe|com)$/i, "").toLowerCase() === "bash";
+	const found = isBash
+		? findWindowsBash(effectiveEnv)?.path
+		: findOnPath(bin, effectiveEnv, { exts: WINDOWS_SHELL_EXTS });
 	if (!found) {
 		throw new Error(
-			`shell "${bin}" not found on PATH (searched ${WINDOWS_SHELL_EXTS.join("/")}). Pass an absolute path, or use "powershell" / "cmd" / an installed bash.`,
+			isBash
+				? 'bash not found: not on PATH, not derivable from git.exe, and not in a known Git install root. Install Git for Windows, or set PI_UNIFIED_EXEC_BASH to your bash.exe.'
+				: `shell "${bin}" not found on PATH (searched ${WINDOWS_SHELL_EXTS.join("/")}). Pass an absolute path, or use "powershell" / "cmd" / an installed bash.`,
 		);
 	}
 	if (!env) resolvedBinaryCache.set(`shell:${bin}`, found);

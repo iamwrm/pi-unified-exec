@@ -420,7 +420,7 @@ npm install
 npx tsx --test tests/*.test.ts
 ```
 
-168 tests across 12 files: HeadTailBuffer (direct port of codex's unit
+178 tests across 12 files: HeadTailBuffer (direct port of codex's unit
 tests), Notify/Gate/sleep, collectOutputUntilDeadline (10 scenarios incl.
 abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
 (ported from pi, 13 scenarios), unescapeChars (14 scenarios for
@@ -514,15 +514,29 @@ Supported — both pipes and PTY mode:
 
 - **PTY (`tty: true`) uses ConPTY** via `@homebridge/node-pty-prebuilt-multiarch`
   (win32 prebuilds — no compilation).
-- **Default shell**: `bash` when found on PATH (Git Bash / MSYS2);
-  otherwise falls back to `powershell` with a one-time warning. System32's
-  `bash.exe` (the WSL stub) is deliberately excluded from the probe — it
-  runs commands inside a WSL distro's filesystem view, not Windows'.
-  Explicit `shell: "cmd"` (`/d /s /c`, verbatim command line — works in
-  both pipe and tty mode) and `shell: "powershell"` / `"pwsh"`
+- **Default shell**: `bash`, located with an extended probe (first hit
+  wins, cached):
+  1. `PI_UNIFIED_EXEC_BASH` env var (explicit override)
+  2. `bash` on PATH — System32's `bash.exe` (the WSL stub) is deliberately
+     excluded: it runs commands inside a WSL distro's filesystem view, not
+     Windows'
+  3. **derived from `git.exe` on PATH** — Git for Windows' default
+     installer puts only `Git\cmd` (git.exe) on PATH, not `Git\bin`, so
+     "git works but bash doesn't" is the most common setup; the probe
+     walks up from git.exe and finds `<GitRoot>\bin\bash.exe`
+  4. well-known install roots (`%ProgramFiles%\Git`, `%ProgramW6432%\Git`,
+     `%ProgramFiles(x86)%\Git`, `%LocalAppData%\Programs\Git`)
+  5. `powershell` fallback, with a one-time warning
+
+  When bash is found off PATH (steps 3–4), a one-time info notice shows the
+  path being used. Derived hits use `bin\bash.exe` — Git's launcher, which
+  sets up MSYS PATH so `ls`/`grep`/`sed` work in the child — never
+  `usr\bin\bash.exe`. Explicit `shell: "bash"` gets the same extended
+  probe. Explicit `shell: "cmd"` (`/d /s /c`, verbatim command line —
+  works in both pipe and tty mode) and `shell: "powershell"` / `"pwsh"`
   (`-NoProfile -Command`) are supported. Bare shell names are resolved to
-  their absolute PATH match before spawning, so a binary planted in an
-  untrusted workdir can't shadow the real shell.
+  an absolute path before spawning (failing closed if unresolvable), so a
+  binary planted in an untrusted workdir can't shadow the real shell.
 - **No POSIX signals.** Every kill — `kill_session`, `/unified-exec-sessions`,
   LRU eviction, `session_shutdown` — is a force tree-kill
   (`taskkill /pid <pid> /T /F`), regardless of the requested signal name.

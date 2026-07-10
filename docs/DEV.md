@@ -50,7 +50,7 @@ npx tsc --noEmit                    # clean typecheck
 npx tsx --test tests/*.test.ts      # all tests (~10–15s)
 ```
 
-You should see `tests 168 … fail 0` (one test is skipped when no real
+You should see `tests 178 … fail 0` (one test is skipped when no real
 `python3` is installed — e.g. on Windows, where the Store stub doesn't
 count).
 
@@ -383,7 +383,7 @@ as appropriate for semver.
 
 1. `npm ci` — reproducible install from `package-lock.json`
 2. `npx tsc --noEmit` — typecheck
-3. `npx tsx --test tests/*.test.ts` — full test suite (168 tests)
+3. `npx tsx --test tests/*.test.ts` — full test suite (178 tests)
 4. **Version-vs-tag guard**: fails CI if `package.json` version doesn't
    match the git tag. Catches the "forgot to bump" footgun.
    `npm version` does both atomically so this normally passes.

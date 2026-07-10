@@ -16,6 +16,7 @@ import { after, describe, it } from "node:test";
 import {
 	buildShellCommand,
 	findOnPath,
+	findWindowsBash,
 	IS_WINDOWS,
 	probeWindowsDefaultShell,
 	resolveBinary,
@@ -145,12 +146,58 @@ describe("findOnPath", () => {
 	});
 });
 
+describe("findWindowsBash", () => {
+	it("PI_UNIFIED_EXEC_BASH override wins when it points at a file", () => {
+		const dir = makePathDir("envbash", ["custom-bash.exe"]);
+		const r = findWindowsBash({ PATH: "", PI_UNIFIED_EXEC_BASH: join(dir, "custom-bash.exe") });
+		assert.deepEqual(r, { path: join(dir, "custom-bash.exe"), source: "env" });
+	});
+
+	it("PI_UNIFIED_EXEC_BASH pointing at a nonexistent file is ignored", () => {
+		const dir = makePathDir("envbash2", ["bash.exe"]);
+		const r = findWindowsBash({ PATH: dir, PI_UNIFIED_EXEC_BASH: "C:\\nope\\bash.exe" });
+		assert.deepEqual(r, { path: join(dir, "bash.exe"), source: "path" });
+	});
+
+	it("finds bash on PATH first", () => {
+		const dir = makePathDir("pathbash", ["bash.exe"]);
+		assert.deepEqual(findWindowsBash({ PATH: dir }), { path: join(dir, "bash.exe"), source: "path" });
+	});
+
+	it("derives bash from git.exe in Git\\cmd (default installer PATH layout)", () => {
+		// The common setup: only <root>\cmd (git.exe) is on PATH; bash lives
+		// in <root>\bin.
+		const root = makePathDir("gitroot", ["cmd/git.exe", "bin/bash.exe"]);
+		const r = findWindowsBash({ PATH: join(root, "cmd") });
+		assert.deepEqual(r, { path: join(root, "bin", "bash.exe"), source: "git-derived" });
+	});
+
+	it("derives bash from git.exe in Git\\mingw64\\bin (two levels down)", () => {
+		const root = makePathDir("gitroot2", ["mingw64/bin/git.exe", "bin/bash.exe"]);
+		const r = findWindowsBash({ PATH: join(root, "mingw64", "bin") });
+		assert.deepEqual(r, { path: join(root, "bin", "bash.exe"), source: "git-derived" });
+	});
+
+	it("falls back to well-known install roots via env", () => {
+		const pf = makePathDir("pf", ["Git/bin/bash.exe"]);
+		const r = findWindowsBash({ PATH: "", ProgramFiles: pf });
+		assert.deepEqual(r, { path: join(pf, "Git", "bin", "bash.exe"), source: "install-root" });
+		const lad = makePathDir("lad", ["Programs/Git/bin/bash.exe"]);
+		const r2 = findWindowsBash({ PATH: "", LOCALAPPDATA: lad });
+		assert.deepEqual(r2, { path: join(lad, "Programs", "Git", "bin", "bash.exe"), source: "install-root" });
+	});
+
+	it("returns undefined when nothing is found", () => {
+		assert.equal(findWindowsBash({ PATH: "" }), undefined);
+	});
+});
+
 describe("probeWindowsDefaultShell", () => {
 	it("prefers bash when on PATH (absolute path, fellBack=false)", () => {
 		const bashDir = makePathDir("gitbash", ["bash.exe"]);
 		const psDir = makePathDir("ps1", ["powershell.exe"]);
 		const r = probeWindowsDefaultShell({ PATH: bashDir + delimiter + psDir });
-		assert.deepEqual(r, { shell: join(bashDir, "bash.exe"), fellBack: false });
+		assert.deepEqual(r, { shell: join(bashDir, "bash.exe"), fellBack: false, bashSource: "path" });
 	});
 
 	it("skips System32's WSL bash stub and falls back to powershell", () => {
@@ -158,6 +205,16 @@ describe("probeWindowsDefaultShell", () => {
 		const r = probeWindowsDefaultShell({ PATH: join(sys32, "System32") });
 		assert.equal(r.fellBack, true);
 		assert.equal(r.shell, join(sys32, "System32", "powershell.exe"));
+	});
+
+	it("uses git-derived bash when bash itself is off PATH", () => {
+		const root = makePathDir("gitroot3", ["cmd/git.exe", "bin/bash.exe"]);
+		const r = probeWindowsDefaultShell({ PATH: join(root, "cmd") });
+		assert.deepEqual(r, {
+			shell: join(root, "bin", "bash.exe"),
+			fellBack: false,
+			bashSource: "git-derived",
+		});
 	});
 
 	it("falls back to the canonical absolute powershell path when nothing is on PATH", () => {
@@ -186,6 +243,16 @@ describe("resolveWindowsShell", () => {
 
 	it("passes explicit paths through", () => {
 		assert.equal(resolveWindowsShell("C:\\tools\\x.exe", { PATH: "" }), "C:\\tools\\x.exe");
+	});
+
+	it("explicit shell:\"bash\" gets the extended probe (git-derived)", () => {
+		const root = makePathDir("gitroot4", ["cmd/git.exe", "bin/bash.exe"]);
+		assert.equal(resolveWindowsShell("bash", { PATH: join(root, "cmd") }), join(root, "bin", "bash.exe"));
+		assert.equal(resolveWindowsShell("bash.exe", { PATH: join(root, "cmd") }), join(root, "bin", "bash.exe"));
+	});
+
+	it("unresolvable bash throws the bash-specific guidance", () => {
+		assert.throws(() => resolveWindowsShell("bash", { PATH: "" }), /PI_UNIFIED_EXEC_BASH/);
 	});
 });
 

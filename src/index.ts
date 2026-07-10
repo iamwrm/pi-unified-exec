@@ -185,6 +185,7 @@ interface ExtensionCtx {
 	widgetVisible: boolean;
 	exitUnsubscribers: Map<number, () => void>;
 	warnedShellFallback: boolean;
+	notifiedBashSource: boolean;
 	/**
 	 * Sessions spawned but not yet inserted into the store (inside the
 	 * early-exit grace window). session_shutdown must see these too —
@@ -261,9 +262,20 @@ async function runExecCommand(
 		if (resolved.fellBack && !ctx.warnedShellFallback) {
 			ctx.warnedShellFallback = true;
 			ctx.ui?.notify(
-				"unified-exec: bash not found on PATH; falling back to powershell. Install Git Bash for best results.",
+				"unified-exec: no bash found (PATH, git-derived, or known install roots); falling back to powershell. Install Git Bash or set PI_UNIFIED_EXEC_BASH.",
 				"warning",
 			);
+		} else if (
+			!resolved.fellBack &&
+			resolved.bashSource &&
+			resolved.bashSource !== "path" &&
+			resolved.bashSource !== "env" &&
+			!ctx.notifiedBashSource
+		) {
+			// bash located off PATH (derived from git.exe or a known install
+			// root) — say so once, so shell selection is never mysterious.
+			ctx.notifiedBashSource = true;
+			ctx.ui?.notify(`unified-exec: using bash at ${resolved.shell} (not on PATH)`, "info");
 		}
 	} else if (IS_WINDOWS) {
 		// Resolve bare names to the absolute PATH match, failing closed —
@@ -772,6 +784,7 @@ export default function (pi: ExtensionAPI) {
 		widgetVisible: false,
 		exitUnsubscribers: new Map(),
 		warnedShellFallback: false,
+		notifiedBashSource: false,
 		pendingSessions: new Set(),
 		shuttingDown: false,
 	};
