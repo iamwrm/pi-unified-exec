@@ -102,9 +102,18 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 			const r2 = await h.call("write_stdin", {
 				session_id: sid,
 				chars: "print(2 + 40)\r",
-				yield_time_ms: 800,
+				yield_time_ms: 2000,
 			});
-			assert.ok(r2.details.output.includes("42"), `got: ${r2.details.output}`);
+			let output = r2.details.output as string;
+			// Cold python startup on a loaded CI runner can exceed the write's
+			// yield window (input is buffered by the PTY and executes once the
+			// REPL is up). Keep polling before declaring failure.
+			for (let i = 0; i < 3 && !output.includes("42"); i++) {
+				const poll = await h.call("write_stdin", { session_id: sid, yield_time_ms: 5000 });
+				output += poll.details.output;
+				if (poll.details.session_id === undefined) break; // REPL died
+			}
+			assert.ok(output.includes("42"), `got: ${output}`);
 
 			// Quit.
 			await h.call("write_stdin", { session_id: sid, chars: "exit()\r", yield_time_ms: 1500 });
