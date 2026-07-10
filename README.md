@@ -62,9 +62,10 @@ pi install -l npm:pi-unified-exec         # project-local (.pi/settings.json)
 ```
 
 `pi install` runs `npm install` under the hood, which fetches
-`node-pty-prebuilt-multiarch` (prebuilt binaries — no compilation). If the
-install fails on your platform, pipe mode (`tty: false`) still works, but PTY
-mode (`tty: true`) will error with a clear message.
+`@homebridge/node-pty-prebuilt-multiarch` (prebuilt binaries for
+linux/macOS/Windows — no compilation). If the install fails on your
+platform, pipe mode (`tty: false`) still works, but PTY mode (`tty: true`)
+will error with a clear message.
 
 To try without installing:
 
@@ -84,7 +85,7 @@ Runs a command in a persistent session.
 |---|---|---|---|
 | `cmd` | string | — | Shell command. Required. |
 | `workdir` | string | turn cwd | Working directory. |
-| `shell` | string | `bash` | Shell binary. |
+| `shell` | string | `bash` | Shell binary. On Windows: `bash` if on PATH, else `powershell`. `cmd` / `powershell` / `pwsh` get shell-appropriate flags. |
 | `tty` | boolean | `false` | Allocate a PTY (requires node-pty). |
 | `yield_time_ms` | number | `10_000` | How long to wait for output, clamped to [250, 30_000]. |
 
@@ -185,7 +186,7 @@ Pi-flavor. Not in codex.
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `session_id` | number | — | Required. |
-| `signal` | string | `"SIGTERM"` | Escalates to SIGKILL after 2s. Pass `"SIGKILL"` to skip the grace. |
+| `signal` | string | `"SIGTERM"` | Escalates to SIGKILL after 2s. Pass `"SIGKILL"` to skip the grace. On Windows any signal force-kills the process tree immediately. |
 
 Signal names are normalized (`term`, `INT`, `sigkill` all work). Unknown
 names are rejected with an error instead of silently no-opping.
@@ -322,7 +323,8 @@ src/
 ├── head-tail-buffer.ts   # direct port of codex's HeadTailBuffer
 ├── collect.ts            # collectOutputUntilDeadline
 ├── notify.ts             # Notify / Gate / sleep primitives
-├── pty.ts                # node-pty loader + pipes fallback
+├── pty.ts                # node-pty loader + pipes fallback + Windows tree-kill
+├── shell.ts              # shell selection & argv construction (Windows-aware)
 ├── render.ts             # renderCall / renderResult for the TUI
 └── unescape.ts           # C-style escape decoder for write_stdin `chars`
 ```
@@ -382,13 +384,13 @@ session_id: 1
 ---
 >>>
 
-> write_stdin(session_id=1, chars="print(7*6)\n", yield_time_ms=1000)
+> write_stdin(session_id=1, chars="print(7*6)\r", yield_time_ms=1000)     # \r = Enter (portable; \n fails on Windows)
 [still running]
 ---
 42
 >>>
 
-> write_stdin(session_id=1, chars="exit()\n", yield_time_ms=1000)
+> write_stdin(session_id=1, chars="exit()\r", yield_time_ms=1000)
 [exited]
 exit_code: 0
 ```
@@ -402,7 +404,7 @@ session_id: 1
 ---
 [sudo] password for wr:
 
-> write_stdin(session_id=1, chars="<password>\n", yield_time_ms=2000)
+> write_stdin(session_id=1, chars="<password>\r", yield_time_ms=2000)
 [exited]
 exit_code: 0
 ---
@@ -418,7 +420,7 @@ npm install
 npx tsx --test tests/*.test.ts
 ```
 
-129 tests across 10 files: HeadTailBuffer (direct port of codex's unit
+168 tests across 12 files: HeadTailBuffer (direct port of codex's unit
 tests), Notify/Gate/sleep, collectOutputUntilDeadline (10 scenarios incl.
 abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
 (ported from pi, 13 scenarios), unescapeChars (14 scenarios for
@@ -429,7 +431,14 @@ full e2e pipes (35+ scenarios incl. log-file retention, byte/line truncation,
 spawn-failure diagnostics, EPIPE safety, exited-session reporting, shutdown
 SIGKILL escalation, onUpdate streaming, and the `/unified-exec-sessions`
 command), PTY mode (3 scenarios: simple command, Python REPL drive, Ctrl-C
-injection).
+injection, cmd.exe verbatim payload), shell selection (per-shell argv
+construction, PATH lookup with synthetic PATH fixtures, Windows
+bash→powershell fallback both branches, WSL-stub exclusion, binary
+resolution caching), PTY loader guard (EXPECT_PTY assertion so a prebuild
+load failure is a red build, ConPTY disposal mock), and cmd.exe quoting
+e2e (operators, embedded quotes, %VAR%, parentheses, pipes).
+
+CI runs the suite on ubuntu, macos, and windows runners.
 
 ## Improvements over codex
 
@@ -498,7 +507,47 @@ completion and never revisit the log, it'll linger until your next reboot.
 - No persistence across pi restarts. (Processes are terminated on
   `session_shutdown`.)
 - No PTY resize (SIGWINCH) handling.
-- No Windows PTY (conpty). Prebuilt binaries cover linux/macOS only.
+
+## Windows
+
+Supported — both pipes and PTY mode:
+
+- **PTY (`tty: true`) uses ConPTY** via `@homebridge/node-pty-prebuilt-multiarch`
+  (win32 prebuilds — no compilation).
+- **Default shell**: `bash` when found on PATH (Git Bash / MSYS2);
+  otherwise falls back to `powershell` with a one-time warning. System32's
+  `bash.exe` (the WSL stub) is deliberately excluded from the probe — it
+  runs commands inside a WSL distro's filesystem view, not Windows'.
+  Explicit `shell: "cmd"` (`/d /s /c`, verbatim command line — works in
+  both pipe and tty mode) and `shell: "powershell"` / `"pwsh"`
+  (`-NoProfile -Command`) are supported. Bare shell names are resolved to
+  their absolute PATH match before spawning, so a binary planted in an
+  untrusted workdir can't shadow the real shell.
+- **No POSIX signals.** Every kill — `kill_session`, `/unified-exec-sessions`,
+  LRU eviction, `session_shutdown` — is a force tree-kill
+  (`taskkill /pid <pid> /T /F`), regardless of the requested signal name.
+  Killed processes report `exit_code: 1` rather than `signal: SIGTERM`, and
+  escalation-to-SIGKILL never happens (the first kill is already final).
+  Tree-kill matters: killing only the shell would orphan grandchildren, which
+  also hold the stdio pipes open and delay exit detection.
+- **Log files** live in `%TEMP%` (`os.tmpdir()`), same naming scheme.
+- **Kill failures are reported, not hidden.** If `taskkill` doesn't land
+  (access denied, protected process), `kill_session` says so and the session
+  stays registered for retry — it is never silently dropped while the
+  process lives.
+- **Supply-chain note (PTY prebuilds).** npm's lockfile integrity covers the
+  `@homebridge/node-pty-prebuilt-multiarch` JS payload, but the native
+  ConPTY binary is fetched at install time by `prebuild-install` from the
+  package's GitHub releases (TLS, homebridge org) — those bytes are not
+  covered by an npm digest. The dependency is pinned exactly; if your threat
+  model requires more, vendor the prebuild or build node-pty from source.
+- Ctrl-C injection (`write_stdin chars="\x03"`) works in PTY mode — ConPTY
+  translates it into a real console interrupt. In pipe mode it's just a byte,
+  as on every platform.
+- **Submit tty input with `\r`, not `\n`.** POSIX terminals map CR→NL so
+  both work there, but legacy Windows console line input only executes on
+  CR — with `\n` a REPL echoes the text without running it.
+  `write_stdin chars="print(6*7)\r"` is portable; `\n` is not.
 
 ## Source map vs codex
 

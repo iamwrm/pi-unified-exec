@@ -43,7 +43,7 @@
 		"typebox": "*"
 	},
 	"optionalDependencies": {
-		"node-pty-prebuilt-multiarch": "0.10.1-pre.5"
+		"@homebridge/node-pty-prebuilt-multiarch": "0.13.1"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-coding-agent": "0.80.3",

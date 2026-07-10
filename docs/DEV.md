@@ -7,8 +7,10 @@ and tool reference, see [../README.md](../README.md).
 
 - **Node 18+** (we use `AbortSignal`, `fetch`, native ESM with `.ts`
   imports via [tsx](https://github.com/privatenumber/tsx)).
-- **Linux or macOS.** Windows PTY (conpty) is not wired up; pipes mode
-  (`tty: false`) would work but hasn't been tested.
+- **Linux, macOS, or Windows.** On Windows, Git Bash is strongly
+  recommended (it's the default shell when on PATH; otherwise commands
+  fall back to `powershell`). PTY mode uses ConPTY via the
+  `@homebridge/node-pty-prebuilt-multiarch` win32 prebuilds.
 - **pi** installed and runnable (`pi --version`). End users install with
   `pi install npm:pi-unified-exec`; for development you want a local clone
   of this repo (see below).
@@ -36,7 +38,7 @@ or install directly from the local path (writes into pi's settings):
 pi install -l ./path/to/pi-unified-exec
 ```
 
-`npm install` fetches `node-pty-prebuilt-multiarch` prebuilds. If your
+`npm install` fetches `@homebridge/node-pty-prebuilt-multiarch` prebuilds. If your
 platform has no prebuild the optional dep fails silently — pipe mode
 (`tty: false`) still works; only `tty: true` will error with a clear
 message at call time.
@@ -48,7 +50,9 @@ npx tsc --noEmit                    # clean typecheck
 npx tsx --test tests/*.test.ts      # all tests (~10–15s)
 ```
 
-You should see `tests 102 suites 12 pass 102 fail 0`.
+You should see `tests 168 … fail 0` (one test is skipped when no real
+`python3` is installed — e.g. on Windows, where the Store stub doesn't
+count).
 
 ## Repo layout
 
@@ -65,7 +69,8 @@ sibling view, indexed by concern:
 | On-disk log file mirroring | `src/session.ts` (`logStream`) |
 | Tail truncation for the LLM | `truncateTail` imported from `@earendil-works/pi-coding-agent` |
 | C-style escape decoding for `chars` | `src/unescape.ts` |
-| PTY vs pipe spawning | `src/pty.ts` |
+| PTY vs pipe spawning, Windows tree-kill | `src/pty.ts` |
+| Shell selection & argv construction | `src/shell.ts` |
 | TUI renderCall / renderResult | `src/render.ts` |
 | Constants mirroring codex | top of `src/index.ts` |
 
@@ -126,7 +131,7 @@ npx tsx --test tests/head-tail-buffer.test.ts \
 npx tsx --test tests/e2e.test.ts
 npx tsx --test tests/chars-encoding.test.ts
 
-# PTY-backed (requires node-pty-prebuilt-multiarch to have loaded)
+# PTY-backed (requires @homebridge/node-pty-prebuilt-multiarch to have loaded)
 npx tsx --test tests/e2e-pty.test.ts
 
 # The yield-deadline loop
@@ -378,7 +383,7 @@ as appropriate for semver.
 
 1. `npm ci` — reproducible install from `package-lock.json`
 2. `npx tsc --noEmit` — typecheck
-3. `npx tsx --test tests/*.test.ts` — full test suite (102 tests)
+3. `npx tsx --test tests/*.test.ts` — full test suite (168 tests)
 4. **Version-vs-tag guard**: fails CI if `package.json` version doesn't
    match the git tag. Catches the "forgot to bump" footgun.
    `npm version` does both atomically so this normally passes.

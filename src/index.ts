@@ -41,6 +41,7 @@ import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
+import { buildShellCommand, IS_WINDOWS, resolveDefaultShell, resolveWindowsShell } from "./shell.ts";
 import { unescapeChars } from "./unescape.ts";
 
 // ---------------- Constants (mirror codex) ----------------
@@ -183,6 +184,15 @@ interface ExtensionCtx {
 	ui: ExtensionContext["ui"] | undefined;
 	widgetVisible: boolean;
 	exitUnsubscribers: Map<number, () => void>;
+	warnedShellFallback: boolean;
+	/**
+	 * Sessions spawned but not yet inserted into the store (inside the
+	 * early-exit grace window). session_shutdown must see these too —
+	 * otherwise a shutdown racing exec_command orphans the child.
+	 */
+	pendingSessions: Set<ExecSession>;
+	/** Set on session_shutdown; new exec_commands are rejected. */
+	shuttingDown: boolean;
 }
 
 type ExecCommandArgs = {
@@ -232,28 +242,49 @@ async function runExecCommand(
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	cwd: string,
 ): Promise<ResponseShape> {
+	if (ctx.shuttingDown) {
+		throw new Error("unified-exec: session is shutting down; not starting new commands.");
+	}
 	const tty = args.tty ?? false;
 	if (tty && !isPtyAvailable()) {
 		throw new Error(
-			`tty: true requires node-pty-prebuilt-multiarch but it failed to load: ${getPtyLoadError() ?? "unknown"}.\n` +
+			`tty: true requires @homebridge/node-pty-prebuilt-multiarch but it failed to load: ${getPtyLoadError() ?? "unknown"}.\n` +
 				`Run:  cd .pi/extensions/unified-exec && npm install\n` +
 				`Or call with tty: false (default).`,
 		);
 	}
 
-	const shellBin = args.shell ?? "bash";
-	const command = [shellBin, "-c", args.cmd];
+	let shellBin = args.shell;
+	if (!shellBin) {
+		const resolved = resolveDefaultShell();
+		shellBin = resolved.shell;
+		if (resolved.fellBack && !ctx.warnedShellFallback) {
+			ctx.warnedShellFallback = true;
+			ctx.ui?.notify(
+				"unified-exec: bash not found on PATH; falling back to powershell. Install Git Bash for best results.",
+				"warning",
+			);
+		}
+	} else if (IS_WINDOWS) {
+		// Resolve bare names to the absolute PATH match, failing closed —
+		// Windows' CreateProcess checks the child's cwd (the LLM-supplied
+		// workdir) before PATH for bare names, so an unresolved name must
+		// never reach spawn.
+		shellBin = resolveWindowsShell(shellBin);
+	}
+	const shellCommand = buildShellCommand(shellBin, args.cmd);
 	const effectiveCwd = args.workdir && args.workdir.length > 0 ? args.workdir : cwd;
 	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_EXEC_YIELD_MS);
 
 	const id = ctx.store.allocateId();
 	const session = ExecSession.spawn(id, {
-		command,
+		command: shellCommand.command,
 		cwd: effectiveCwd,
 		env: process.env,
 		tty,
 		displayCommand: args.cmd,
 		shell: shellBin,
+		windowsVerbatimArguments: shellCommand.windowsVerbatimArguments,
 	});
 
 	if (session.failureMessage) {
@@ -273,6 +304,10 @@ async function runExecCommand(
 		});
 	}
 
+	// Track the session from spawn to store-insertion: session_shutdown must
+	// be able to terminate children that are still inside the grace window.
+	ctx.pendingSessions.add(session);
+	try {
 	// Early-exit grace: if the process dies within 150 ms, treat it as a
 	// short-lived command and never register it.
 	const start = Date.now();
@@ -379,6 +414,9 @@ async function runExecCommand(
 		command: args.cmd,
 		yieldTimeMs,
 	});
+	} finally {
+		ctx.pendingSessions.delete(session);
+	}
 }
 
 async function runWriteStdin(
@@ -484,12 +522,17 @@ interface TerminateOutcome {
 	session: ExecSession;
 	escalated: boolean;
 	finalOutput: string;
+	/** true when the process is confirmed dead; false = kill did NOT land. */
+	killed: boolean;
 }
 
 /**
  * Kill a session (initial signal → 2s grace → SIGKILL escalation), drain its
- * trailing output, and remove it from the store. Shared by the kill_session
- * tool and the /unified-exec-sessions command.
+ * trailing output, and remove it from the store — but ONLY on confirmed
+ * exit. A kill that doesn't land (taskkill failure, access denied,
+ * unkillable state) keeps the session in the store and returns
+ * killed: false, so ownership of a live process is never silently dropped.
+ * Shared by the kill_session tool and the /unified-exec-sessions command.
  */
 async function terminateSessionById(
 	ctx: ExtensionCtx,
@@ -505,7 +548,10 @@ async function terminateSessionById(
 		await sleep(50);
 	}
 	let escalated = false;
-	if (!session.hasExited) {
+	// On Windows every kill is already a force tree-kill (taskkill /T /F);
+	// a "SIGKILL escalation" would spawn a byte-identical taskkill that
+	// cannot behave differently, so skip it there.
+	if (!session.hasExited && !IS_WINDOWS) {
 		session.kill("SIGKILL");
 		escalated = true;
 		const kdeadline = Date.now() + 500;
@@ -521,8 +567,9 @@ async function terminateSessionById(
 		exited: session.exited,
 		deadlineMs: Date.now() + 100,
 	});
-	removeSession(ctx, sid);
-	return { session, escalated, finalOutput: decode(collected) };
+	const killed = session.hasExited;
+	if (killed) removeSession(ctx, sid);
+	return { session, escalated, finalOutput: decode(collected), killed };
 }
 
 interface FinalizeInput {
@@ -724,6 +771,9 @@ export default function (pi: ExtensionAPI) {
 		ui: undefined,
 		widgetVisible: false,
 		exitUnsubscribers: new Map(),
+		warnedShellFallback: false,
+		pendingSessions: new Set(),
+		shuttingDown: false,
 	};
 
 	// By default, unified-exec removes pi's built-in `bash` tool so the LLM
@@ -737,6 +787,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx.ui = eventCtx.ui;
+		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
 		updateRunningSessionsUi(ctx);
 		// Default behavior is to remove the built-in `bash` tool. Only keep it
 		// if --keep-builtin-bash was passed. Flag lookup uses the registered
@@ -764,26 +815,46 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		// Reject new sessions from here on and terminate everything we own —
+		// including sessions still inside exec_command's early-exit grace
+		// window (spawned but not yet inserted into the store).
+		ctx.shuttingDown = true;
 		const drained = ctx.store.terminateAll();
+		for (const s of ctx.pendingSessions) {
+			if (!s.hasExited) {
+				s.terminate();
+				drained.push(s);
+			}
+		}
 		clearSessionExitWatchers(ctx);
 		updateRunningSessionsUi(ctx);
 		// Children run detached (own process groups), so anything that ignores
 		// SIGTERM would outlive pi as an orphan. Give them a short grace, then
-		// SIGKILL survivors and wait briefly for confirmation.
+		// SIGKILL survivors and wait briefly for confirmation. On Windows the
+		// initial kill is already a force tree-kill and a second taskkill is
+		// byte-identical, so skip the escalation there (the grace wait above
+		// still confirms exits).
 		const graceDeadline = Date.now() + 1000;
 		while (drained.some((s) => !s.hasExited) && Date.now() < graceDeadline) {
 			await sleep(50);
 		}
-		const survivors = drained.filter((s) => !s.hasExited);
-		for (const s of survivors) s.kill("SIGKILL");
-		if (survivors.length) {
-			const killDeadline = Date.now() + 500;
-			while (drained.some((s) => !s.hasExited) && Date.now() < killDeadline) {
-				await sleep(25);
+		if (!IS_WINDOWS) {
+			const survivors = drained.filter((s) => !s.hasExited);
+			for (const s of survivors) s.kill("SIGKILL");
+			if (survivors.length) {
+				const killDeadline = Date.now() + 500;
+				while (drained.some((s) => !s.hasExited) && Date.now() < killDeadline) {
+					await sleep(25);
+				}
 			}
 		}
 		if (drained.length && ctx.ui) {
-			ctx.ui.notify(`unified-exec: terminated ${drained.length} live session(s) on shutdown`, "info");
+			const leftover = drained.filter((s) => !s.hasExited).length;
+			ctx.ui.notify(
+				`unified-exec: terminated ${drained.length - leftover} live session(s) on shutdown` +
+					(leftover ? `; ${leftover} did not confirm exit` : ""),
+				 leftover ? "warning" : "info",
+			);
 		}
 	});
 
@@ -815,12 +886,18 @@ export default function (pi: ExtensionAPI) {
 			if (!choice) return;
 			const targets = choice === KILL_ALL ? sessions : sessions.filter((s) => choice.startsWith(`#${s.id} `));
 			let killed = 0;
+			let failed = 0;
 			for (const s of targets) {
 				const outcome = await terminateSessionById(ctx, s.id, "SIGTERM");
-				if (outcome) killed++;
+				if (outcome?.killed) killed++;
+				else if (outcome) failed++;
 			}
 			updateRunningSessionsUi(ctx);
-			cmdCtx.ui.notify(`unified-exec: killed ${killed} ${plural(killed, "session")}`, "info");
+			cmdCtx.ui.notify(
+				`unified-exec: killed ${killed} ${plural(killed, "session")}` +
+					(failed ? `; ${failed} did not confirm exit (still listed)` : ""),
+				failed ? "warning" : "info",
+			);
 		},
 	});
 
@@ -840,7 +917,12 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
 			workdir: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
-			shell: Type.Optional(Type.String({ description: "Shell binary. Defaults to bash." })),
+			shell: Type.Optional(
+				Type.String({
+					description:
+						"Shell binary. Defaults to bash (on Windows: bash if on PATH, else powershell). cmd and powershell/pwsh get shell-appropriate flags.",
+				}),
+			),
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a PTY. Default false (plain pipes)." })),
 			yield_time_ms: Type.Optional(
 				Type.Number({
@@ -872,6 +954,7 @@ export default function (pi: ExtensionAPI) {
 			`Prefer one long empty poll over many short polls to avoid filling the conversation with repeated partial output; for prompt-cache-sensitive runs, set ${MAX_EMPTY_POLL_ENV_VAR}=300000 to keep polls within typical 5-minute cache expiry windows.`,
 			"Use long empty polls for builds, test suites, installs, downloads, data processing, and other jobs that do not need interaction.",
 			"Do not use long polls for interactive sessions such as REPLs, sudo, ssh, password prompts, or commands where you may need to send input soon.",
+			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
 		parameters: Type.Object({
@@ -910,7 +993,7 @@ export default function (pi: ExtensionAPI) {
 		name: "kill_session",
 		label: "kill_session",
 		description:
-			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s). Use when the process won't exit via Ctrl-C. session_id is invalid after.",
+			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after.",
 		promptSnippet: "Terminate a session",
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session to terminate." }),
@@ -929,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
 					details: { session_id: sid, found: false },
 				};
 			}
-			const { session, escalated, finalOutput: text } = outcome;
+			const { session, escalated, finalOutput: text, killed } = outcome;
 			updateRunningSessionsUi(ctx);
 			const details = {
 				session_id: sid,
@@ -937,8 +1020,26 @@ export default function (pi: ExtensionAPI) {
 				exit_code: session.exitCode,
 				signal: session.signal,
 				escalated,
+				killed,
 				log_path: session.logPath,
 			};
+			if (!killed) {
+				// The kill did NOT land — do not pretend it did. The session
+				// stays in the store so it can be retried or inspected.
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`FAILED to terminate session ${sid} (pid ${session.pid ?? "?"}): process still running after ${initial}` +
+								(escalated ? " and SIGKILL escalation" : "") +
+								`. The session remains registered — retry kill_session, or check permissions.` +
+								(session.logPath ? `\nlog_path: ${session.logPath}` : ""),
+						},
+					],
+					details,
+				};
+			}
 			const summary =
 				`Killed session ${sid} (pid ${session.pid ?? "?"}) with ${initial}` +
 				(escalated ? " — escalated to SIGKILL" : "") +

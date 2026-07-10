@@ -2,6 +2,141 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-10
+
+### Fixed (second review round)
+
+A second review pass (different reviewer model, empirical reproductions)
+found residual issues in the Windows PR; all majors addressed:
+
+- **taskkill was cwd-hijackable**: Windows' CreateProcess checks the
+  parent's cwd before PATH for bare names, so a `taskkill.exe` planted in
+  an untrusted repository would run on every kill. Now invoked via the
+  absolute `%SystemRoot%\System32\taskkill.exe`.
+- **Failed kills were reported as successful**: `kill_session` removed the
+  session from the store even when the process never exited (e.g. taskkill
+  failure/access denied), silently dropping ownership of a live process.
+  Termination outcomes now carry `killed`; unconfirmed kills keep the
+  session registered and return an explicit FAILED message (same for the
+  `/unified-exec-sessions` command and the shutdown notification).
+- **Shutdown raced session creation**: `exec_command` inserts into the
+  store only after the 150 ms early-exit grace, so a `session_shutdown`
+  inside that window drained the store without seeing the new child —
+  reproduced, orphaning a live process. Spawned sessions are now tracked in
+  a pending set that shutdown also terminates, and new `exec_command`s are
+  rejected after shutdown until the next `session_start`.
+- **Multiline cmd.exe commands were silently truncated**: `cmd /c` stops at
+  the first newline. `buildShellCommand` now fails closed with a clear
+  error (join with ` & `, or use powershell/bash) instead of silently
+  running only the first line.
+- **Unresolved bare shell names could execute from the workdir**:
+  `resolveBinary`'s bare-name passthrough let CreateProcess find a planted
+  `powershell.exe` in the child cwd. Shell resolution now fails closed
+  (`resolveWindowsShell` throws for unresolvable names, only accepts
+  .com/.exe — Node can't spawn .cmd/.bat directly), and the last-resort
+  powershell fallback is the canonical absolute System32 path, never a
+  bare name.
+- **Windows-only cmd specialization no longer leaks to POSIX**: a POSIX
+  binary named `cmd` now gets plain `-c` (powershell/pwsh keep `-Command`
+  everywhere — pwsh is cross-platform).
+- **findOnPath resolves relative PATH entries to absolute paths** (results
+  were cwd-dependent), and the double force-kill on Windows shutdown was
+  removed.
+- **PTY input now has a mandatory cross-platform assertion**: a repo-owned
+  Node line-echo fixture asserts write_stdin round-trips (and exit-code
+  propagation) under a real PTY on every platform — no longer only the
+  skippable python REPL test. The Windows-only direct CI step also runs
+  pty-load first so it can't pass by skipping.
+- **README**: PTY examples now use `\r` (Enter) instead of `\n`; added a
+  supply-chain note documenting that the native ConPTY prebuild is fetched
+  by `prebuild-install` outside npm's integrity envelope (pinned exactly;
+  vendor or build from source for stricter guarantees).
+
+Known residual (documented): LRU eviction and shutdown kills remain
+best-effort (no per-kill confirmation loop); Job Objects remain the
+follow-up for true group-kill semantics.
+
+## 2026-07-09
+
+### Fixed (post-review)
+
+A multi-perspective code review of the Windows PR produced 17 confirmed
+findings; all majors and most minors addressed:
+
+- **`shell: "cmd"` with `tty: true` was broken**: node-pty has no
+  `windowsVerbatimArguments` and its `argsToCommandLine()` re-escapes
+  embedded quotes, mangling the pre-quoted `/s /c` payload into a
+  guaranteed syntax error (and diverging the executed command from the
+  displayed one). The PTY path now passes the args as a single raw
+  command-line string, which node-pty uses verbatim. Covered by a new
+  Windows PTY e2e test.
+- **PTY dependency load is now guarded in CI**: new `tests/pty-load.test.ts`
+  asserts `isPtyAvailable()` when `EXPECT_PTY=1` (set on all matrix legs),
+  so a prebuild failure is a red build instead of a silent skip of the
+  whole PTY suite. The dep is pinned exactly (`0.13.1`) since
+  `disposeWindowsConpty` relies on undocumented internals (now also locked
+  by a mock-agent unit test).
+- **Dropped the fallback `require("node-pty-prebuilt-multiarch")`**: the
+  old package name is no longer declared, so Node's resolution would walk
+  ancestor `node_modules` — a planted package could inject unaudited native
+  code. Only the declared @homebridge package is loaded.
+- **Shell resolution hardening**: `findOnPath` only accepts regular files
+  (a directory named `bash` no longer matches) and returns absolute paths;
+  bare shell names are resolved to their absolute PATH match before
+  spawning (Windows' CreateProcess checks the child's cwd — the
+  LLM-supplied workdir — before PATH); System32's WSL `bash.exe` stub is
+  excluded from the default-shell probe; resolutions are cached
+  (previously every Windows PTY spawn re-scanned PATH synchronously).
+- **Windows kill escalation removed**: the "SIGKILL escalation" was a
+  byte-identical second `taskkill /T /F` after a wasted 2 s poll; on
+  Windows the first kill is already final, so escalation is skipped.
+- **Real fallback-branch coverage**: `resolveDefaultShell` takes an
+  injectable env; tests drive both the bash-found and powershell-fallback
+  branches (plus caching) with synthetic PATH fixtures on every platform.
+  cmd.exe quoting is e2e-tested against `&`, embedded quotes, `%VAR%`,
+  parentheses, and pipes — the inputs the mechanism exists for.
+- **CI**: direct PTY diagnostic step scoped to Windows (was doubling the
+  slowest suite on all 6 legs). Removed a redundant SIGSEGV assertion and
+  a stale python3 silent-skip branch that could mask real REPL failures.
+
+Known limitation (documented, not fixed): `taskkill /T` cannot reach
+grandchildren once the direct child has exited — true group-kill semantics
+would need Windows Job Objects; tracked as a possible follow-up.
+
+### Added
+
+- **Windows support** (fixes [#3](https://github.com/iamwrm/pi-unified-exec/issues/3)):
+  - **Process-tree kill via `taskkill /pid <pid> /T /F`**: POSIX
+    process-group kills (`process.kill(-pid)`) don't exist on Windows;
+    killing only the shell orphaned grandchildren, which also held the
+    stdio pipes open and delayed exit detection past the escalation
+    grace. Every kill path (`kill_session`, LRU eviction,
+    `session_shutdown`, `/unified-exec-sessions`) now force tree-kills on
+    Windows. Pipes are spawned with `detached: false` there (no process
+    groups to detach into).
+  - **Windows PTY (ConPTY)**: swapped the optional PTY dependency from
+    `node-pty-prebuilt-multiarch` (linux/macOS prebuilds only) to the
+    API-compatible `@homebridge/node-pty-prebuilt-multiarch` fork
+    (adds win32 prebuilds, covers Node 22/24 ABIs). The loader prefers
+    the new package and falls back to the old name. On Windows the PTY
+    binary is resolved to a full path (bare `bash` fails ConPTY's
+    "File not found" check), kills go through taskkill (node-pty's
+    `kill()` throws on signal names and its console-list helper crashes
+    on dead children), and ConPTY's conout worker thread + named-pipe
+    sockets are disposed on exit — they otherwise keep the host event
+    loop alive forever.
+  - **Shell selection** (new `src/shell.ts`): default shell is `bash`
+    everywhere; on Windows without bash on PATH it falls back to
+    `powershell` with a one-time warning. Explicit `shell: "cmd"` gets
+    `/d /s /c` + verbatim args (cmd's quoting rules), `powershell`/`pwsh`
+    get `-NoProfile -Command`, POSIX shells keep `-c`.
+  - **CI**: `windows-latest` added to the matrix. Platform-aware test
+    fixes: SIGTERM-trap escalation doesn't apply on Windows (first kill
+    is already final), Windows' signal table lacks
+    SIGPIPE/SIGUSR1/SIGUSR2, and the python3 REPL PTY test now probes for
+    a real interpreter (the WindowsApps Store stub stays alive without
+    being a REPL). New `tests/shell.test.ts` (9 scenarios).
+
 ## 2026-07-08
 
 ### Fixed

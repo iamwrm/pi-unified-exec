@@ -11,6 +11,7 @@ import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
+import { IS_WINDOWS } from "../src/shell.ts";
 
 interface ToolDef {
 	name: string;
@@ -98,6 +99,42 @@ describe("unified-exec e2e", () => {
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 300_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 1_800_000);
+	});
+
+	it("Windows: shell=powershell and shell=cmd get shell-appropriate flags", { skip: !IS_WINDOWS }, async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "Write-Output ps-ok", shell: "powershell", yield_time_ms: 20000 });
+		assert.ok(r1.details.output.includes("ps-ok"), `output=${r1.details.output}`);
+		assert.equal(r1.details.exit_code, 0);
+		const r2 = await h.call("exec_command", { cmd: "echo cmd-ok", shell: "cmd", yield_time_ms: 20000 });
+		assert.ok(r2.details.output.includes("cmd-ok"), `output=${r2.details.output}`);
+		assert.equal(r2.details.exit_code, 0);
+		await h.emit("session_shutdown");
+	});
+
+	it("Windows: cmd.exe quoting survives operators, quotes, %VAR%, parens", { skip: !IS_WINDOWS }, async () => {
+		// These are exactly the inputs the /d /s /c "<cmd>" + verbatim-args
+		// mechanism exists for; `echo simple` would pass even if it broke.
+		const h = makeHarness();
+		await h.emit("session_start");
+		const cases: Array<{ cmd: string; expect: string[] }> = [
+			{ cmd: "echo one& echo two", expect: ["one", "two"] }, // & separator
+			{ cmd: 'echo "a & b"', expect: ['"a & b"'] }, // quoted & is literal
+			{ cmd: "echo %OS%", expect: ["Windows_NT"] }, // env expansion
+			{ cmd: "(echo grouped)", expect: ["grouped"] }, // parentheses
+			// findstr, not find: Git Bash environments often shadow Windows'
+			// find.exe with GNU find earlier on PATH.
+			{ cmd: "echo piped-x | findstr piped", expect: ["piped-x"] }, // pipe
+		];
+		for (const { cmd, expect } of cases) {
+			const r = await h.call("exec_command", { cmd, shell: "cmd", yield_time_ms: 20000 });
+			assert.equal(r.details.exit_code, 0, `cmd=${cmd} details=${JSON.stringify(r.details)}`);
+			for (const e of expect) {
+				assert.ok(r.details.output.includes(e), `cmd=${cmd} expected "${e}" in output=${r.details.output}`);
+			}
+		}
+		await h.emit("session_shutdown");
 	});
 
 	it("short-lived command returns exit_code and no session_id", async () => {
@@ -293,7 +330,21 @@ describe("unified-exec e2e", () => {
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number");
 		const r2 = await h.call("kill_session", { session_id: sid });
-		assert.equal(r2.details.escalated, true, `details=${JSON.stringify(r2.details)}`);
+		if (IS_WINDOWS) {
+			// No POSIX signals on Windows: the initial "SIGTERM" is already a
+			// force tree-kill (taskkill /T /F) and escalation is skipped (a
+			// second identical taskkill can't behave differently). Don't assert
+			// on exit timing (taskkill on a loaded runner can exceed the 2s
+			// window) — assert the session is gone from the store instead.
+			assert.equal(r2.details.escalated, false, `details=${JSON.stringify(r2.details)}`);
+			const l = await h.call("list_sessions", {});
+			assert.ok(
+				!l.details.sessions.some((s: any) => s.session_id === sid && s.running),
+				`session ${sid} still listed as running: ${JSON.stringify(l.details)}`,
+			);
+		} else {
+			assert.equal(r2.details.escalated, true, `details=${JSON.stringify(r2.details)}`);
+		}
 		await h.emit("session_shutdown");
 	});
 
@@ -409,6 +460,43 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 		const l = await h.call("list_sessions", {});
 		assert.equal(l.details.active_count, 0);
+	});
+
+	it("session_shutdown racing exec_command creation does not orphan the child", async () => {
+		// Regression: exec_command inserts into the store only AFTER the
+		// 150ms early-exit grace; a shutdown inside that window used to drain
+		// the store without seeing the new session, leaving the process alive
+		// and untracked.
+		const h = makeHarness();
+		await h.emit("session_start");
+		const inflight = h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 500 });
+		await new Promise((r) => setTimeout(r, 40)); // inside the grace window
+		await h.emit("session_shutdown");
+		const r = await inflight;
+		// The pending session must have been terminated by the shutdown: the
+		// call resolves with exit info (or a dead session), never a live one.
+		if (r.details.session_id !== undefined) {
+			await new Promise((res) => setTimeout(res, 1000)); // let the tree-kill land
+			const l = await h.call("list_sessions", {});
+			assert.ok(
+				!l.details.sessions.some((s: any) => s.running),
+				`orphaned live session: ${JSON.stringify(l.details)}`,
+			);
+		} else {
+			assert.ok(r.details.exit_code != null || r.details.signal, JSON.stringify(r.details));
+		}
+	});
+
+	it("exec_command is rejected after session_shutdown until the next session_start", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		await h.emit("session_shutdown");
+		await assert.rejects(() => h.call("exec_command", { cmd: "echo nope" }), /shutting down/);
+		// A new session_start re-arms the extension (reload/new/resume).
+		await h.emit("session_start");
+		const r = await h.call("exec_command", { cmd: "echo back" });
+		assert.equal(r.details.exit_code, 0);
+		await h.emit("session_shutdown");
 	});
 
 	for (const reason of ["quit", "reload", "new", "resume", "fork"] as const) {
@@ -569,16 +657,26 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("nonexistent shell binary surfaces a failure_message", async () => {
+	it("nonexistent shell binary fails diagnosably", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		const r = await h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" });
-		assert.equal(r.details.session_id, undefined, JSON.stringify(r.details));
-		assert.ok(
-			typeof r.details.failure_message === "string" && /ENOENT/.test(r.details.failure_message),
-			`expected ENOENT failure_message; got ${JSON.stringify(r.details)}`,
-		);
-		assert.ok(r.content[0].text.includes("failure:"), r.content[0].text);
+		if (IS_WINDOWS) {
+			// Fail-closed: resolution throws before spawn — a bare name must
+			// never reach CreateProcess (cwd-first lookup could execute a
+			// planted binary from an untrusted workdir).
+			await assert.rejects(
+				() => h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" }),
+				/not found on PATH/,
+			);
+		} else {
+			const r = await h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" });
+			assert.equal(r.details.session_id, undefined, JSON.stringify(r.details));
+			assert.ok(
+				typeof r.details.failure_message === "string" && /ENOENT/.test(r.details.failure_message),
+				`expected ENOENT failure_message; got ${JSON.stringify(r.details)}`,
+			);
+			assert.ok(r.content[0].text.includes("failure:"), r.content[0].text);
+		}
 		await h.emit("session_shutdown");
 	});
 
@@ -607,10 +705,16 @@ describe("unified-exec e2e", () => {
 		// the failure instead of silently dropping the bytes.
 		const r3 = await h.call("write_stdin", { session_id: sid, chars: "again\n", yield_time_ms: 300 });
 		if (r3.details.session_id !== undefined) {
-			assert.ok(
-				typeof r3.details.failure_message === "string" && r3.details.failure_message.includes("stdin"),
-				`expected stdin failure note; got ${JSON.stringify(r3.details)}`,
-			);
+			// On Windows, writes to a pipe whose reader closed don't fail
+			// deterministically (bytes can sit in the pipe buffer without an
+			// error), so the failure note may legitimately never appear. The
+			// core guarantee — the host doesn't crash — holds either way.
+			if (!IS_WINDOWS) {
+				assert.ok(
+					typeof r3.details.failure_message === "string" && r3.details.failure_message.includes("stdin"),
+					`expected stdin failure note; got ${JSON.stringify(r3.details)}`,
+				);
+			}
 			await h.call("kill_session", { session_id: sid });
 		}
 		await h.emit("session_shutdown");
