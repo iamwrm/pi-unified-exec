@@ -127,6 +127,41 @@ describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
 		}
 	});
 
+	it("write_stdin round-trips input through a Node line-echo fixture", async () => {
+		// Repo-owned fixture (no python dependency): a Node child that echoes
+		// each stdin line as GOT:<line>| and exits 7 on "quit". This asserts
+		// MANDATORY PTY input behavior on every platform — a no-op
+		// write-to-pty implementation cannot pass this test.
+		const fixture =
+			"node -e 'let b=\"\";process.stdin.on(\"data\",d=>{b+=d.toString();let i;while((i=b.search(/[\\r\\n]/))>=0){const line=b.slice(0,i).trim();b=b.slice(i+1);if(line){process.stdout.write(\"GOT:\"+line+\"|\\n\");if(line===\"quit\")process.exit(7);}}})'";
+		const h = makeHarness();
+		await h.emit("session_start");
+		try {
+			const r1 = await h.call("exec_command", { cmd: fixture, tty: true, yield_time_ms: 1500 });
+			const sid = r1.details.session_id;
+			assert.equal(typeof sid, "number", `fixture did not stay alive: ${JSON.stringify(r1.details)}`);
+
+			const r2 = await h.call("write_stdin", { session_id: sid, chars: "hello\r", yield_time_ms: 2000 });
+			let output = r2.details.output as string;
+			for (let i = 0; i < 2 && !output.includes("GOT:hello|"); i++) {
+				const poll = await h.call("write_stdin", { session_id: sid, yield_time_ms: 5000 });
+				output += poll.details.output;
+				if (poll.details.session_id === undefined) break;
+			}
+			assert.ok(output.includes("GOT:hello|"), `PTY input did not round-trip: ${JSON.stringify(output)}`);
+
+			const r3 = await h.call("write_stdin", { session_id: sid, chars: "quit\r", yield_time_ms: 3000 });
+			let exitCode = r3.details.exit_code;
+			if (r3.details.session_id !== undefined) {
+				const poll = await h.call("write_stdin", { session_id: sid, yield_time_ms: 5000 });
+				exitCode = poll.details.exit_code;
+			}
+			assert.equal(exitCode, 7, `fixture did not exit on quit: ${JSON.stringify(r3.details)}`);
+		} finally {
+			await h.emit("session_shutdown");
+		}
+	});
+
 	it("Windows: shell=cmd with tty:true works (verbatim /c payload)", { skip: !IS_WINDOWS }, async () => {
 		// Regression: node-pty's argsToCommandLine re-escapes embedded quotes,
 		// so array-args mangled the pre-quoted /s /c payload into

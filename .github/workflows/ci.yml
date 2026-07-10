@@ -40,7 +40,10 @@ jobs:
       # via the glob below.
       - name: Test (PTY e2e, direct)
         if: runner.os == 'Windows'
-        run: npx tsx tests/e2e-pty.test.ts
+        # pty-load first: the e2e file skips itself when PTY is unavailable,
+        # so without the load assertion this diagnostic could "pass" by
+        # skipping everything.
+        run: npx tsx tests/pty-load.test.ts && npx tsx tests/e2e-pty.test.ts
         timeout-minutes: 5
         env:
           EXPECT_PTY: "1"

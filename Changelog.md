@@ -2,6 +2,60 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-10
+
+### Fixed (second review round)
+
+A second review pass (different reviewer model, empirical reproductions)
+found residual issues in the Windows PR; all majors addressed:
+
+- **taskkill was cwd-hijackable**: Windows' CreateProcess checks the
+  parent's cwd before PATH for bare names, so a `taskkill.exe` planted in
+  an untrusted repository would run on every kill. Now invoked via the
+  absolute `%SystemRoot%\System32\taskkill.exe`.
+- **Failed kills were reported as successful**: `kill_session` removed the
+  session from the store even when the process never exited (e.g. taskkill
+  failure/access denied), silently dropping ownership of a live process.
+  Termination outcomes now carry `killed`; unconfirmed kills keep the
+  session registered and return an explicit FAILED message (same for the
+  `/unified-exec-sessions` command and the shutdown notification).
+- **Shutdown raced session creation**: `exec_command` inserts into the
+  store only after the 150 ms early-exit grace, so a `session_shutdown`
+  inside that window drained the store without seeing the new child —
+  reproduced, orphaning a live process. Spawned sessions are now tracked in
+  a pending set that shutdown also terminates, and new `exec_command`s are
+  rejected after shutdown until the next `session_start`.
+- **Multiline cmd.exe commands were silently truncated**: `cmd /c` stops at
+  the first newline. `buildShellCommand` now fails closed with a clear
+  error (join with ` & `, or use powershell/bash) instead of silently
+  running only the first line.
+- **Unresolved bare shell names could execute from the workdir**:
+  `resolveBinary`'s bare-name passthrough let CreateProcess find a planted
+  `powershell.exe` in the child cwd. Shell resolution now fails closed
+  (`resolveWindowsShell` throws for unresolvable names, only accepts
+  .com/.exe — Node can't spawn .cmd/.bat directly), and the last-resort
+  powershell fallback is the canonical absolute System32 path, never a
+  bare name.
+- **Windows-only cmd specialization no longer leaks to POSIX**: a POSIX
+  binary named `cmd` now gets plain `-c` (powershell/pwsh keep `-Command`
+  everywhere — pwsh is cross-platform).
+- **findOnPath resolves relative PATH entries to absolute paths** (results
+  were cwd-dependent), and the double force-kill on Windows shutdown was
+  removed.
+- **PTY input now has a mandatory cross-platform assertion**: a repo-owned
+  Node line-echo fixture asserts write_stdin round-trips (and exit-code
+  propagation) under a real PTY on every platform — no longer only the
+  skippable python REPL test. The Windows-only direct CI step also runs
+  pty-load first so it can't pass by skipping.
+- **README**: PTY examples now use `\r` (Enter) instead of `\n`; added a
+  supply-chain note documenting that the native ConPTY prebuild is fetched
+  by `prebuild-install` outside npm's integrity envelope (pinned exactly;
+  vendor or build from source for stricter guarantees).
+
+Known residual (documented): LRU eviction and shutdown kills remain
+best-effort (no per-kill confirmation loop); Job Objects remain the
+follow-up for true group-kill semantics.
+
 ## 2026-07-09
 
 ### Fixed (post-review)

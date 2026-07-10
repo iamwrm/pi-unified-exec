@@ -20,6 +20,7 @@ import {
 	probeWindowsDefaultShell,
 	resolveBinary,
 	resolveDefaultShell,
+	resolveWindowsShell,
 	resetDefaultShellCache,
 } from "../src/shell.ts";
 
@@ -77,12 +78,26 @@ describe("buildShellCommand", () => {
 		]);
 	});
 
-	it("cmd gets /d /s /c with a quoted command and verbatim args", () => {
-		const r = buildShellCommand("cmd", "dir /b");
+	it("cmd gets /d /s /c with a quoted command and verbatim args (Windows)", () => {
+		const r = buildShellCommand("cmd", "dir /b", true);
 		assert.deepEqual(r.command, ["cmd", "/d", "/s", "/c", '"dir /b"']);
 		assert.equal(r.windowsVerbatimArguments, true);
-		const r2 = buildShellCommand("cmd.exe", "echo hi");
+		const r2 = buildShellCommand("cmd.exe", "echo hi", true);
 		assert.deepEqual(r2.command, ["cmd.exe", "/d", "/s", "/c", '"echo hi"']);
+	});
+
+	it("a POSIX binary that happens to be named cmd gets plain -c", () => {
+		const r = buildShellCommand("/opt/tools/cmd", "echo hi", false);
+		assert.deepEqual(r.command, ["/opt/tools/cmd", "-c", "echo hi"]);
+		assert.equal(r.windowsVerbatimArguments, undefined);
+	});
+
+	it("multiline commands for cmd.exe fail closed instead of silently truncating", () => {
+		assert.throws(() => buildShellCommand("cmd", "echo one\necho two", true), /multiline/);
+		assert.throws(() => buildShellCommand("cmd", "echo one\r\necho two", true), /multiline/);
+		// Multiline is fine for shells that support it.
+		assert.doesNotThrow(() => buildShellCommand("bash", "echo one\necho two", true));
+		assert.doesNotThrow(() => buildShellCommand("powershell", "echo one\necho two", true));
 	});
 });
 
@@ -145,8 +160,32 @@ describe("probeWindowsDefaultShell", () => {
 		assert.equal(r.shell, join(sys32, "System32", "powershell.exe"));
 	});
 
-	it("falls back to bare 'powershell' when nothing is on PATH", () => {
-		assert.deepEqual(probeWindowsDefaultShell({ PATH: "" }), { shell: "powershell", fellBack: true });
+	it("falls back to the canonical absolute powershell path when nothing is on PATH", () => {
+		// Never a bare name: Windows' cwd-first lookup could execute a
+		// planted powershell.exe from an untrusted workdir.
+		const r = probeWindowsDefaultShell({ PATH: "" });
+		assert.equal(r.fellBack, true);
+		assert.match(r.shell, /[\\/]System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+	});
+});
+
+describe("resolveWindowsShell", () => {
+	it("resolves bare names to absolute .exe paths", () => {
+		const dir = makePathDir("ws", ["myshell.exe"]);
+		assert.equal(resolveWindowsShell("myshell", { PATH: dir }), join(dir, "myshell.exe"));
+	});
+
+	it("fails closed on unresolvable bare names (no cwd-first spawn)", () => {
+		assert.throws(() => resolveWindowsShell("nonexistent-shell-4711", { PATH: "" }), /not found on PATH/);
+	});
+
+	it("does not resolve to .cmd/.bat (Node cannot spawn them directly)", () => {
+		const dir = makePathDir("wscmd", ["wrapper.cmd", "wrapper.bat"]);
+		assert.throws(() => resolveWindowsShell("wrapper", { PATH: dir }), /not found on PATH/);
+	});
+
+	it("passes explicit paths through", () => {
+		assert.equal(resolveWindowsShell("C:\\tools\\x.exe", { PATH: "" }), "C:\\tools\\x.exe");
 	});
 });
 
@@ -185,5 +224,37 @@ describe("resolveBinary", () => {
 
 	it("returns the bare name when unresolvable", () => {
 		assert.equal(resolveBinary("definitely-not-real-98765", { PATH: "" }), "definitely-not-real-98765");
+	});
+
+	it("caches no-env resolutions across PATH changes (production path)", () => {
+		resetDefaultShellCache();
+		const dir = makePathDir("rbcache", IS_WINDOWS ? ["cachetool.exe"] : ["cachetool"]);
+		const savedPath = process.env.PATH;
+		try {
+			process.env.PATH = dir;
+			const first = resolveBinary("cachetool");
+			assert.equal(first, join(dir, IS_WINDOWS ? "cachetool.exe" : "cachetool"));
+			process.env.PATH = ""; // a fresh lookup would now fail...
+			assert.equal(resolveBinary("cachetool"), first); // ...but the cache holds
+		} finally {
+			process.env.PATH = savedPath;
+			resetDefaultShellCache();
+		}
+	});
+
+	it("resolves relative PATH entries to absolute paths", () => {
+		// A relative PATH entry must not produce a cwd-dependent result.
+		const found = findOnPath("node", { PATH: process.env.PATH ?? "" });
+		assert.ok(found);
+		const dir = makePathDir("rel", IS_WINDOWS ? ["reltool.exe"] : ["reltool"]);
+		const cwd = process.cwd();
+		try {
+			process.chdir(join(dir, ".."));
+			const rel = dir.slice(join(dir, "..").length + 1); // relative dir name
+			const hit = findOnPath("reltool", { PATH: rel }, { exts: IS_WINDOWS ? [".exe"] : [""] });
+			assert.ok(hit && (hit.startsWith("/") || /^[A-Za-z]:[\\/]/.test(hit)), `not absolute: ${hit}`);
+		} finally {
+			process.chdir(cwd);
+		}
 	});
 });

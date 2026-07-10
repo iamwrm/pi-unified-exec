@@ -8,12 +8,26 @@
  */
 
 import { statSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 
 export const IS_WINDOWS = process.platform === "win32";
 
-/** Executable extensions probed on Windows, in order. */
-const WINDOWS_EXEC_EXTS = [".exe", ".cmd", ".bat", ""];
+/** Executable extensions probed on Windows (PATHEXT order), plus bare. */
+const WINDOWS_EXEC_EXTS = [".com", ".exe", ".bat", ".cmd", ""];
+
+/**
+ * Extensions valid for a SHELL binary. Only formats CreateProcess runs
+ * directly: Node refuses to spawn .bat/.cmd without shell:true
+ * (CVE-2024-27980 hardening), so resolving a shell to a .cmd wrapper would
+ * produce an unspawnable EINVAL path.
+ */
+const WINDOWS_SHELL_EXTS = [".com", ".exe"];
+
+/** %SystemRoot%\System32 path builder with a sane fallback. */
+function system32(...parts: string[]): string {
+	const root = process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows";
+	return join(root, "System32", ...parts);
+}
 
 export interface ShellCommand {
 	command: string[];
@@ -30,20 +44,33 @@ function shellBase(shellBin: string): string {
 	return base.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
 }
 
-/** Build the argv for running `cmd` under the given shell binary. */
-export function buildShellCommand(shellBin: string, cmd: string): ShellCommand {
-	switch (shellBase(shellBin)) {
-		case "cmd":
-			// /d skip AutoRun, /s standard quote handling, /c run-and-exit.
-			// Verbatim so cmd.exe sees exactly: /d /s /c "<cmd>"
-			return { command: [shellBin, "/d", "/s", "/c", `"${cmd}"`], windowsVerbatimArguments: true };
-		case "powershell":
-		case "pwsh":
-			return { command: [shellBin, "-NoProfile", "-Command", cmd] };
-		default:
-			// bash, sh, zsh, fish, … all take -c.
-			return { command: [shellBin, "-c", cmd] };
+/**
+ * Build the argv for running `cmd` under the given shell binary.
+ * `isWindows` is a parameter (defaulting to the real platform) so tests can
+ * exercise both branches anywhere.
+ */
+export function buildShellCommand(shellBin: string, cmd: string, isWindows: boolean = IS_WINDOWS): ShellCommand {
+	const base = shellBase(shellBin);
+	// cmd.exe specialization only applies on Windows — a POSIX binary that
+	// happens to be named `cmd` must get the uniform `-c` treatment.
+	if (isWindows && base === "cmd") {
+		if (/[\r\n]/.test(cmd)) {
+			// cmd.exe /c silently stops at the first newline, executing only
+			// the first line — fail closed rather than silently truncate.
+			throw new Error(
+				'cmd.exe cannot run multiline commands via /c (everything after the first line is silently dropped). Join lines with " & ", or use shell: "powershell" or bash.',
+			);
+		}
+		// /d skip AutoRun, /s standard quote handling, /c run-and-exit.
+		// Verbatim so cmd.exe sees exactly: /d /s /c "<cmd>"
+		return { command: [shellBin, "/d", "/s", "/c", `"${cmd}"`], windowsVerbatimArguments: true };
 	}
+	// powershell/pwsh take -Command on every platform (pwsh is cross-platform).
+	if (base === "powershell" || base === "pwsh") {
+		return { command: [shellBin, "-NoProfile", "-Command", cmd] };
+	}
+	// bash, sh, zsh, fish, … all take -c.
+	return { command: [shellBin, "-c", cmd] };
 }
 
 export interface FindOnPathOptions {
@@ -68,7 +95,9 @@ export function findOnPath(
 	for (const dir of pathVar.split(delimiter)) {
 		if (!dir) continue;
 		for (const ext of exts) {
-			const full = join(dir, bin + ext);
+			// resolve() (not join): a relative PATH entry must not yield a
+			// cwd-dependent result that breaks when spawned from another cwd.
+			const full = resolve(dir, bin + ext);
 			if (opts.exclude?.test(full)) continue;
 			try {
 				if (statSync(full).isFile()) return full;
@@ -104,7 +133,13 @@ export function probeWindowsDefaultShell(
 	const bash = findOnPath("bash", env, { exts, exclude: SYSTEM32_RE });
 	if (bash) return { shell: bash, fellBack: false };
 	const powershell = findOnPath("powershell", env, { exts });
-	return { shell: powershell ?? "powershell", fellBack: true };
+	// Last resort: the canonical absolute location, never a bare name — a
+	// bare name would let Windows' cwd-first lookup execute a
+	// powershell.exe planted in an untrusted workdir.
+	return {
+		shell: powershell ?? system32("WindowsPowerShell", "v1.0", "powershell.exe"),
+		fellBack: true,
+	};
 }
 
 let cachedDefaultShell: DefaultShell | undefined;
@@ -141,6 +176,31 @@ export function resolveBinary(bin: string, env?: NodeJS.ProcessEnv): string {
 	const resolved = findOnPath(bin) ?? bin;
 	resolvedBinaryCache.set(bin, resolved);
 	return resolved;
+}
+
+/**
+ * Resolve a Windows SHELL binary to an absolute path, failing closed.
+ *
+ * Unlike resolveBinary, an unresolvable bare name throws instead of passing
+ * through: spawning a bare name lets CreateProcess check the child's cwd
+ * (the LLM-supplied workdir) first, so "powershell" with a mangled PATH
+ * would happily execute an attacker's powershell.exe from an untrusted
+ * repo. Only .com/.exe are accepted (Node can't spawn .cmd/.bat directly).
+ */
+export function resolveWindowsShell(bin: string, env?: NodeJS.ProcessEnv): string {
+	if (/[\\/]/.test(bin)) return bin; // explicit path: caller's responsibility
+	if (!env) {
+		const cached = resolvedBinaryCache.get(`shell:${bin}`);
+		if (cached) return cached;
+	}
+	const found = findOnPath(bin, env ?? process.env, { exts: WINDOWS_SHELL_EXTS });
+	if (!found) {
+		throw new Error(
+			`shell "${bin}" not found on PATH (searched ${WINDOWS_SHELL_EXTS.join("/")}). Pass an absolute path, or use "powershell" / "cmd" / an installed bash.`,
+		);
+	}
+	if (!env) resolvedBinaryCache.set(`shell:${bin}`, found);
+	return found;
 }
 
 /** Test hook: forget cached shell/binary probes. */

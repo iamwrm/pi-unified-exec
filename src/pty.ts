@@ -143,9 +143,19 @@ export function signalNameFromNumber(num: number): NodeJS.Signals | null {
  * (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE); POSIX handles this case via
  * process groups (`kill -pid` works after the leader exits).
  */
+/**
+ * Absolute path to taskkill.exe. Never spawn the bare name: Windows'
+ * CreateProcess checks the parent's cwd before PATH, so a taskkill.exe
+ * planted in an untrusted repository would execute with every kill.
+ */
+function taskkillPath(): string {
+	const root = process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows";
+	return `${root}\\System32\\taskkill.exe`;
+}
+
 function killWindowsTree(pid: number): void {
 	try {
-		const tk = cpSpawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+		const tk = cpSpawn(taskkillPath(), ["/pid", String(pid), "/T", "/F"], {
 			stdio: "ignore",
 			windowsHide: true,
 		});

@@ -384,13 +384,13 @@ session_id: 1
 ---
 >>>
 
-> write_stdin(session_id=1, chars="print(7*6)\n", yield_time_ms=1000)
+> write_stdin(session_id=1, chars="print(7*6)\r", yield_time_ms=1000)     # \r = Enter (portable; \n fails on Windows)
 [still running]
 ---
 42
 >>>
 
-> write_stdin(session_id=1, chars="exit()\n", yield_time_ms=1000)
+> write_stdin(session_id=1, chars="exit()\r", yield_time_ms=1000)
 [exited]
 exit_code: 0
 ```
@@ -404,7 +404,7 @@ session_id: 1
 ---
 [sudo] password for wr:
 
-> write_stdin(session_id=1, chars="<password>\n", yield_time_ms=2000)
+> write_stdin(session_id=1, chars="<password>\r", yield_time_ms=2000)
 [exited]
 exit_code: 0
 ---
@@ -420,7 +420,7 @@ npm install
 npx tsx --test tests/*.test.ts
 ```
 
-157 tests across 12 files: HeadTailBuffer (direct port of codex's unit
+168 tests across 12 files: HeadTailBuffer (direct port of codex's unit
 tests), Notify/Gate/sleep, collectOutputUntilDeadline (10 scenarios incl.
 abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
 (ported from pi, 13 scenarios), unescapeChars (14 scenarios for
@@ -531,6 +531,16 @@ Supported — both pipes and PTY mode:
   Tree-kill matters: killing only the shell would orphan grandchildren, which
   also hold the stdio pipes open and delay exit detection.
 - **Log files** live in `%TEMP%` (`os.tmpdir()`), same naming scheme.
+- **Kill failures are reported, not hidden.** If `taskkill` doesn't land
+  (access denied, protected process), `kill_session` says so and the session
+  stays registered for retry — it is never silently dropped while the
+  process lives.
+- **Supply-chain note (PTY prebuilds).** npm's lockfile integrity covers the
+  `@homebridge/node-pty-prebuilt-multiarch` JS payload, but the native
+  ConPTY binary is fetched at install time by `prebuild-install` from the
+  package's GitHub releases (TLS, homebridge org) — those bytes are not
+  covered by an npm digest. The dependency is pinned exactly; if your threat
+  model requires more, vendor the prebuild or build node-pty from source.
 - Ctrl-C injection (`write_stdin chars="\x03"`) works in PTY mode — ConPTY
   translates it into a real console interrupt. In pipe mode it's just a byte,
   as on every platform.

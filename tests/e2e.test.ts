@@ -462,6 +462,43 @@ describe("unified-exec e2e", () => {
 		assert.equal(l.details.active_count, 0);
 	});
 
+	it("session_shutdown racing exec_command creation does not orphan the child", async () => {
+		// Regression: exec_command inserts into the store only AFTER the
+		// 150ms early-exit grace; a shutdown inside that window used to drain
+		// the store without seeing the new session, leaving the process alive
+		// and untracked.
+		const h = makeHarness();
+		await h.emit("session_start");
+		const inflight = h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 500 });
+		await new Promise((r) => setTimeout(r, 40)); // inside the grace window
+		await h.emit("session_shutdown");
+		const r = await inflight;
+		// The pending session must have been terminated by the shutdown: the
+		// call resolves with exit info (or a dead session), never a live one.
+		if (r.details.session_id !== undefined) {
+			await new Promise((res) => setTimeout(res, 1000)); // let the tree-kill land
+			const l = await h.call("list_sessions", {});
+			assert.ok(
+				!l.details.sessions.some((s: any) => s.running),
+				`orphaned live session: ${JSON.stringify(l.details)}`,
+			);
+		} else {
+			assert.ok(r.details.exit_code != null || r.details.signal, JSON.stringify(r.details));
+		}
+	});
+
+	it("exec_command is rejected after session_shutdown until the next session_start", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		await h.emit("session_shutdown");
+		await assert.rejects(() => h.call("exec_command", { cmd: "echo nope" }), /shutting down/);
+		// A new session_start re-arms the extension (reload/new/resume).
+		await h.emit("session_start");
+		const r = await h.call("exec_command", { cmd: "echo back" });
+		assert.equal(r.details.exit_code, 0);
+		await h.emit("session_shutdown");
+	});
+
 	for (const reason of ["quit", "reload", "new", "resume", "fork"] as const) {
 		it(`session_shutdown reason=${reason} terminates live sessions`, async () => {
 			const h = makeHarness();
@@ -620,16 +657,26 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("nonexistent shell binary surfaces a failure_message", async () => {
+	it("nonexistent shell binary fails diagnosably", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		const r = await h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" });
-		assert.equal(r.details.session_id, undefined, JSON.stringify(r.details));
-		assert.ok(
-			typeof r.details.failure_message === "string" && /ENOENT/.test(r.details.failure_message),
-			`expected ENOENT failure_message; got ${JSON.stringify(r.details)}`,
-		);
-		assert.ok(r.content[0].text.includes("failure:"), r.content[0].text);
+		if (IS_WINDOWS) {
+			// Fail-closed: resolution throws before spawn — a bare name must
+			// never reach CreateProcess (cwd-first lookup could execute a
+			// planted binary from an untrusted workdir).
+			await assert.rejects(
+				() => h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" }),
+				/not found on PATH/,
+			);
+		} else {
+			const r = await h.call("exec_command", { cmd: "echo hi", shell: "definitely-not-a-real-shell-xyz" });
+			assert.equal(r.details.session_id, undefined, JSON.stringify(r.details));
+			assert.ok(
+				typeof r.details.failure_message === "string" && /ENOENT/.test(r.details.failure_message),
+				`expected ENOENT failure_message; got ${JSON.stringify(r.details)}`,
+			);
+			assert.ok(r.content[0].text.includes("failure:"), r.content[0].text);
+		}
 		await h.emit("session_shutdown");
 	});
 
