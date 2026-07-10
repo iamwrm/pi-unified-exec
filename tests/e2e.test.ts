@@ -93,6 +93,15 @@ function makeHarness() {
 	};
 }
 
+/** Poll until `cond` is true or the deadline passes (CI runners are slow). */
+async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (!cond() && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 50));
+	}
+	return cond();
+}
+
 describe("unified-exec e2e", () => {
 	it("resolveMaxEmptyPollMs reads the empty-poll cap env var", () => {
 		assert.equal(resolveMaxEmptyPollMs({}), 1_800_000);
@@ -398,8 +407,12 @@ describe("unified-exec e2e", () => {
 		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
 		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
 
-		await new Promise((r) => setTimeout(r, 700));
-		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), undefined);
+		// Poll, don't fixed-sleep: `sleep 0.4` can take >700ms wall time on a
+		// loaded CI runner (observed on windows-latest).
+		assert.ok(
+			await waitFor(() => h.uiEvents.statuses.get("unified-exec.sessions") === undefined),
+			`status did not clear: ${h.uiEvents.statuses.get("unified-exec.sessions")}`,
+		);
 
 		const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5000 });
 		assert.equal(r2.details.exit_code, 0, `details=${JSON.stringify(r2.details)}`);
@@ -417,8 +430,11 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
 		assert.ok(h.uiEvents.widgets.get("unified-exec.sessions")?.content?.[0].includes("1 session still running"));
 
-		await new Promise((r) => setTimeout(r, 700));
-		assert.equal(h.uiEvents.widgets.get("unified-exec.sessions")?.content, undefined);
+		// Poll, don't fixed-sleep (slow CI runners).
+		assert.ok(
+			await waitFor(() => h.uiEvents.widgets.get("unified-exec.sessions")?.content === undefined),
+			`widget did not clear: ${JSON.stringify(h.uiEvents.widgets.get("unified-exec.sessions"))}`,
+		);
 
 		const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5000 });
 		assert.equal(r2.details.exit_code, 0, `details=${JSON.stringify(r2.details)}`);
@@ -438,8 +454,11 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
 		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 2 sessions running");
 
-		await new Promise((r) => setTimeout(r, 1100));
-		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
+		// Poll for the short session's exit instead of a fixed 1.1s sleep.
+		assert.ok(
+			await waitFor(() => h.uiEvents.statuses.get("unified-exec.sessions") === "unified-exec: 1 session running"),
+			`status did not decrement: ${h.uiEvents.statuses.get("unified-exec.sessions")}`,
+		);
 		const widget = h.uiEvents.widgets.get("unified-exec.sessions")?.content?.join("\n") ?? "";
 		assert.ok(widget.includes(`#${longSid}`), `widget=${widget}`);
 		assert.ok(!widget.includes(`#${shortSid}`), `widget=${widget}`);
