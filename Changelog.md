@@ -2,6 +2,17 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-10 — 0.6.2
+
+### Changed
+
+- **Default empty-poll yield cap lowered to 290 seconds**: reduced the default
+  empty `write_stdin` poll `yield_time_ms` upper clamp from 30 minutes to
+  290 seconds so a long poll never outlives Anthropic's default 5-minute
+  prompt-cache TTL. The `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` env override still
+  allows raising the cap (e.g. back to `1_800_000`) for cache-insensitive
+  runs. Updated tool guidance, README, and tests accordingly.
+
 ## 2026-07-10 — 0.6.1
 
 ### Added

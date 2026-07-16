@@ -49,7 +49,10 @@ import { unescapeChars } from "./unescape.ts";
 const MIN_YIELD_TIME_MS = 250;
 const MAX_YIELD_TIME_MS = 30_000;
 const MIN_EMPTY_YIELD_TIME_MS = 5_000;
-const DEFAULT_MAX_BACKGROUND_POLL_MS = 1_800_000;
+// Diverges from codex (30 min): kept below Anthropic's 5-minute prompt-cache
+// TTL so a long empty poll never outlives the cached prompt prefix. Raise via
+// the env override below for cache-insensitive runs.
+const DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000;
 export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
@@ -925,7 +928,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
-			`For long-running non-interactive commands, start with a short yield to obtain a session_id, then monitor with one empty write_stdin poll up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 30 minutes; set ${MAX_EMPTY_POLL_ENV_VAR}=300000 for cache-sensitive runs) rather than repeated short polls.`,
+			`For long-running non-interactive commands, start with a short yield to obtain a session_id, then monitor with one empty write_stdin poll up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 290 seconds, kept under Anthropic's 5-minute prompt-cache TTL; raise via ${MAX_EMPTY_POLL_ENV_VAR} for cache-insensitive runs) rather than repeated short polls.`,
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
@@ -963,8 +966,8 @@ export default function (pi: ExtensionAPI) {
 			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary.",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
-			`For known long-running non-interactive jobs, avoid frequent polling. After exec_command returns a session_id, use write_stdin with no chars/chars_b64 and a long yield_time_ms up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 30 minutes).`,
-			`Prefer one long empty poll over many short polls to avoid filling the conversation with repeated partial output; for prompt-cache-sensitive runs, set ${MAX_EMPTY_POLL_ENV_VAR}=300000 to keep polls within typical 5-minute cache expiry windows.`,
+			`For known long-running non-interactive jobs, avoid frequent polling. After exec_command returns a session_id, use write_stdin with no chars/chars_b64 and a long yield_time_ms up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 290 seconds).`,
+			`Prefer one long empty poll over many short polls to avoid filling the conversation with repeated partial output; the default cap already stays within typical 5-minute prompt-cache expiry windows. Set ${MAX_EMPTY_POLL_ENV_VAR} higher (e.g. 1800000) for cache-insensitive runs.`,
 			"Use long empty polls for builds, test suites, installs, downloads, data processing, and other jobs that do not need interaction.",
 			"Do not use long polls for interactive sessions such as REPLs, sudo, ssh, password prompts, or commands where you may need to send input soon.",
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",

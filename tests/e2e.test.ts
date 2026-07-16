@@ -104,10 +104,10 @@ async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> 
 
 describe("unified-exec e2e", () => {
 	it("resolveMaxEmptyPollMs reads the empty-poll cap env var", () => {
-		assert.equal(resolveMaxEmptyPollMs({}), 1_800_000);
+		assert.equal(resolveMaxEmptyPollMs({}), 290_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 300_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
-		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 1_800_000);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 290_000);
 	});
 
 	it("Windows: shell=powershell and shell=cmd get shell-appropriate flags", { skip: !IS_WINDOWS }, async () => {
@@ -188,7 +188,7 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("empty write_stdin poll clamps yield_time_ms to 30 minutes by default", async () => {
+	it("empty write_stdin poll clamps yield_time_ms to 290 seconds by default", async () => {
 		const previous = process.env[MAX_EMPTY_POLL_ENV_VAR];
 		delete process.env[MAX_EMPTY_POLL_ENV_VAR];
 		const h = makeHarness();
@@ -208,7 +208,7 @@ describe("unified-exec e2e", () => {
 				chars: "",
 				yield_time_ms: 2_000_000,
 			});
-			assert.equal(r2.details.yield_time_ms, 1_800_000);
+			assert.equal(r2.details.yield_time_ms, 290_000);
 			assert.equal(r2.details.session_id, undefined);
 			assert.equal(r2.details.exit_code, 0);
 		} finally {

@@ -123,12 +123,13 @@ Drives or polls an existing session.
 | `session_id` | number | — | Required. |
 | `chars` | string | `""` | Empty = pure poll; non-empty writes (after escape decoding) then polls. Mutually exclusive with `chars_b64`. |
 | `chars_b64` | string | `""` | Base64-encoded bytes to write. Binary-safe. Mutually exclusive with `chars`. |
-| `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, configured cap]. Default cap: 1_800_000. |
+| `yield_time_ms` | number | `250` | Clamped [250, 30_000]. Empty polls clamped [5_000, configured cap]. Default cap: 290_000. |
 
 For known long-running, non-interactive jobs, prefer a single long empty poll
 instead of many short polls. After `exec_command` returns a `session_id`, call
 `write_stdin` with no `chars`/`chars_b64` and a long `yield_time_ms` up to the
-configured cap (`1_800_000`, or 30 minutes, by default). This is best for
+configured cap (`290_000`, or 290 seconds, by default — kept under Anthropic's
+5-minute prompt-cache TTL). This is best for
 builds, test suites, installs, downloads, and data processing jobs. Avoid long
 polls for REPLs, `sudo`, `ssh`, password prompts, dev servers, or any command
 where you may need to send input soon.
@@ -137,7 +138,7 @@ where you may need to send input soon.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | `1_800_000` | Maximum wait for an empty `write_stdin` poll. Invalid/unset values use the default; positive values below `5_000` are raised to `5_000`. Set `300_000` to keep long polls within common 5-minute prompt-cache expiry windows. |
+| `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | `290_000` | Maximum wait for an empty `write_stdin` poll. Invalid/unset values use the default; positive values below `5_000` are raised to `5_000`. The default stays under common 5-minute prompt-cache TTLs (e.g. Anthropic); set `1_800_000` for cache-insensitive runs. |
 
 #### Control bytes and escapes in `chars`
 
@@ -268,7 +269,6 @@ Codex-parity unless noted:
 MIN_YIELD_TIME_MS            = 250
 MAX_YIELD_TIME_MS            = 30_000
 MIN_EMPTY_YIELD_TIME_MS      = 5_000
-DEFAULT_MAX_BACKGROUND_POLL_MS = 1_800_000  (env override: PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS)
 DEFAULT_EXEC_YIELD_MS        = 10_000
 DEFAULT_WRITE_STDIN_YIELD_MS = 250
 EARLY_EXIT_GRACE_PERIOD_MS   = 150
@@ -276,6 +276,10 @@ HEAD_TAIL_MAX_BYTES          = 1 MiB   (in-memory drain buffer)
 MAX_SESSIONS                 = 64
 WARNING_SESSIONS             = 60
 LRU_PROTECTED_COUNT          = 8
+
+# Diverges from codex — codex allows 30 min; capped at 290 s by default to
+# stay under Anthropic's 5-minute prompt-cache TTL:
+DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000  (env override: PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS)
 
 # Diverges from codex — matches pi's built-in bash instead:
 DEFAULT_MAX_BYTES            = 50 KiB  (LLM-visible per-call truncation cap)
