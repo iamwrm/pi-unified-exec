@@ -64,7 +64,9 @@ sibling view, indexed by concern:
 | Tool schemas, LLM-visible behavior | `src/index.ts` (tool registrations, `runExecCommand`, `runWriteStdin`) |
 | Session lifecycle (spawn, write, kill, log-stream) | `src/session.ts` |
 | Session registry, LRU eviction, shutdown | `src/session-store.ts` |
-| The yield-until-deadline loop | `src/collect.ts` + `src/notify.ts` |
+| The yield-until-deadline loop (relative polls) | `src/collect.ts` + `src/notify.ts` |
+| Absolute `yield_until` waits (event-driven, monotonic) | `src/long-wait.ts` + `src/time.ts` |
+| `on_exit: "wake"` completion scheduling (exactly-once) | `src/completion.ts` |
 | In-memory drain buffer | `src/head-tail-buffer.ts` |
 | On-disk log file mirroring | `src/session.ts` (`logStream`) |
 | Tail truncation for the LLM | `truncateTail` imported from `@earendil-works/pi-coding-agent` |
@@ -383,7 +385,7 @@ as appropriate for semver.
 
 1. `npm ci` — reproducible install from `package-lock.json`
 2. `npx tsc --noEmit` — typecheck
-3. `npx tsx --test tests/*.test.ts` — full test suite (178 tests)
+3. `npx tsx --test tests/*.test.ts` — full test suite (246 tests)
 4. **Version-vs-tag guard**: fails CI if `package.json` version doesn't
    match the git tag. Catches the "forgot to bump" footgun.
    `npm version` does both atomically so this normally passes.

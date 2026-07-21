@@ -2,6 +2,112 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-21 — 0.7.0
+
+### Added
+
+- **`write_stdin(yield_until)` — absolute-deadline waits.** Empty polls can
+  now stay attached until a strict RFC 3339 UTC deadline (`"2026-07-21T18:30:00Z"`,
+  0–3 fractional digits, uppercase `Z` only; offsets, local timestamps, and
+  JS-normalized impossible dates are rejected; accepted values are normalized
+  with `Date.toISOString()`). Semantics: mutually exclusive with
+  `yield_time_ms` and with input bytes; returns immediately on process exit;
+  a past deadline is an immediate poll; cancellation never kills the child;
+  default horizon 10 h with a new `PI_UNIFIED_EXEC_MAX_ABSOLUTE_WAIT_MS`
+  override — excessive deadlines are rejected with an actionable error, never
+  clamped. The wait is event-driven (exit / cancellation / one timer) on a
+  **monotonic** deadline (wall-clock parsed once, then anchored to
+  `performance.now()`), never drains output into an unbounded local
+  collection (the session's bounded head/tail buffer, rolling TUI tail, and
+  full on-disk log keep working), and replaces the 250 ms TUI heartbeat with
+  an initial update + output-driven updates rate-limited to 30 s + a final
+  update (nothing when nothing changes). Exit wins close exit/deadline/cancel
+  races whenever the session is terminal when the result is assembled. New
+  `src/time.ts` and `src/long-wait.ts`.
+- **`exec_command(on_exit: "wake")` — completion notifications.** A new
+  persistent per-session policy (default `"none"`, Google-compatible
+  string-enum schema): when a backgrounded wake session exits while no tool
+  call is observing it, exactly one synthetic follow-up prompt
+  (`pi.sendMessage` with `customType: "unified-exec-completed"`,
+  `triggerTurn: true`, `deliverAs: "followUp"`) resumes the agent — starting
+  a turn when idle, queued as a follow-up during an active run, never
+  steering. Implemented as a dedicated agent-level `CompletionCoordinator`
+  (`src/completion.ts`) enforcing the exactly-once invariant: terminal
+  completion is delivered through a finalized tool result OR causes one
+  wake, never both. `write_stdin` calls take observation leases; "observed"
+  commits at pi's finalized `tool_execution_end` (an error/cancelled
+  finalization keeps the wake eligible); deadline/cancellation releases the
+  lease with the wake armed. Wakes are armed only after `exec_command`
+  commits to returning a `session_id` (in-yield exits return directly),
+  reserved before sending (no duplicates across repeated exit callbacks or
+  flush triggers), debounced so simultaneous completions batch into one
+  bounded prompt, and retried at the next flush point if submission throws.
+  Suppression: `kill_session` and `/unified-exec-sessions` suppress before
+  signaling (failed kills restore eligibility), live-process LRU eviction
+  and `session_shutdown` suppress, `list_sessions` observing the exit first
+  suppresses, and a naturally-exited wake session evicted before
+  notification keeps a bounded tombstone snapshot (with `log_path`) so its
+  one wake still fires. The prompt carries sanitized bounded metadata
+  (session id, exit code/signal, one-line command, cwd, elapsed, log path,
+  failure info) — never raw stdout/stderr — and the exited session stays
+  drainable afterwards without triggering a second wake.
+- **`tool_time_utc` everywhere it matters**: still-running responses,
+  absolute-deadline responses, direct terminal results of waits, and
+  validation errors now report the current host UTC time so the model can
+  compute wall-clock deadlines itself (no precomputed 10-hour deadline is
+  handed out). New response fields: `wait_mode`, `wait_status`,
+  `yield_until`, `effective_wait_ms`, `on_exit`, `completion_notification`,
+  `completion_delivery`, `on_exit_wake`.
+- **Tests**: 68 new tests (`tests/time.test.ts`, `tests/long-wait.test.ts`,
+  `tests/completion.test.ts`, `tests/wake-e2e.test.ts`) covering timestamp
+  validation, argument validation, long-wait behavior with injected
+  monotonic clocks/timers (no real 290 s / 10 h waits), and the full wake
+  state machine through the real tool pipeline (246 total).
+
+### Verified
+
+- **Live end-to-end run against real pi 0.80.10** (interactive TUI in tmux,
+  `gpt-5.6-sol`, extension loaded via `--no-extensions -e ./src/index.ts`):
+  (1) `on_exit: "wake"` → idle exit delivered exactly one
+  `unified-exec-completed` follow-up that started a turn; the model drained
+  the exited session afterwards with no duplicate wake. (2) `yield_until`
+  accepted by the provider schema; the model computed a valid deadline from
+  `tool_time_utc`; exit-before-deadline returned `wait_status: completed`
+  immediately and consumed the wake (no follow-up). (3) Esc during an
+  absolute wait: pi aborted the turn ("Operation aborted"), the footer
+  showed `until … · cancelled · wake armed`, the process survived, and the
+  later natural exit fired exactly one wake from the aborted-idle state.
+  Across 4 sessions: exactly 2 wakes (unobserved exits) and 2 direct
+  consumptions — the exactly-once invariant held.
+
+### Changed
+
+- **Empty-poll `yield_time_ms` above the cap is now rejected, not clamped**,
+  with an actionable error that names `yield_until` and includes
+  `tool_time_utc`. `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` can still lower the
+  cap but no longer raises the effective cache-friendly maximum above
+  290 s (previously it could raise it arbitrarily). Defaults, minimums, and
+  interactive-input clamping are unchanged.
+- **TUI result footer** now surfaces long-wait state: `until <deadline>`
+  while a `yield_until` session is still running, a `cancelled` marker for
+  aborted absolute waits, and `wake armed` when a completion notification is
+  pending.
+- **Tool guidance rewritten** around the four rules: `yield_time_ms` for
+  interaction/progress polls ≤ 290 s; `yield_until` for deliberate longer
+  waits on finite non-interactive commands; `on_exit: "wake"` to resume on
+  unobserved completion; combining them is safe. `yield_time_ms` is now
+  described as an attachment/progress window, not a process lifetime. An
+  explicit warning forbids `yield_until` for REPLs, sudo, ssh, password
+  prompts, dev servers, file watchers, debuggers, and other
+  indefinite/interactive sessions.
+- **Dependency minimums**: `@earendil-works/pi-coding-agent` peer range
+  narrowed from `*` to `>=0.80.5` — the first published version with the
+  `agent_settled` extension event, used as a safe flush point for pending
+  completion notifications (`tool_execution_end` finalization existed
+  earlier). Dev pins bumped 0.80.3 → 0.80.10. The `agent_settled`
+  subscription is wrapped in try/catch so older runtimes degrade gracefully
+  (wakes still deliver via the debounce timer and tool boundaries).
+
 ## 2026-07-10 — 0.6.2
 
 ### Changed

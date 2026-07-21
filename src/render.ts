@@ -50,6 +50,9 @@ interface DetailsShape {
 	cwd?: string;
 	command?: string;
 	yield_time_ms?: number;
+	yield_until?: string;
+	wait_status?: string;
+	completion_notification?: string;
 	tty?: boolean;
 	output?: string;
 	running?: boolean;
@@ -109,7 +112,7 @@ export function renderExecCommandCall(
 // ---------------- renderCall for write_stdin ----------------
 
 export function renderWriteStdinCall(
-	args: { session_id?: number; chars?: string; chars_b64?: string; yield_time_ms?: number },
+	args: { session_id?: number; chars?: string; chars_b64?: string; yield_time_ms?: number; yield_until?: string },
 	theme: Theme,
 	context: ToolRenderContext<RenderState, typeof args>,
 ): Component {
@@ -129,7 +132,11 @@ export function renderWriteStdinCall(
 		: chars.length > 0
 			? theme.fg("toolTitle", theme.bold(`» ${stringifyChars(chars)}`))
 			: theme.fg("toolTitle", theme.bold(`» (base64, ${base64ByteLength(b64)} bytes)`));
-	const yieldSuffix = yieldMs ? theme.fg("muted", ` (yield ${(yieldMs / 1000).toFixed(1)}s)`) : "";
+	const yieldSuffix = args?.yield_until
+		? theme.fg("muted", ` (until ${args.yield_until})`)
+		: yieldMs
+			? theme.fg("muted", ` (yield ${(yieldMs / 1000).toFixed(1)}s)`)
+			: "";
 	const banner = `${op} ${theme.fg("muted", `→ session_id=${sid}`)}${yieldSuffix}`;
 
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
@@ -291,6 +298,18 @@ function buildStatusLine(
 	}
 	if (d.failure_message) {
 		bits.push(theme.fg("error", `failure: ${d.failure_message}`));
+	}
+
+	// Long-wait / wake state: which absolute deadline was in play, whether the
+	// wait was cancelled, and whether a completion notification is still armed.
+	if (d.yield_until && d.session_id !== undefined) {
+		bits.push(`until ${d.yield_until}`);
+	}
+	if (d.wait_status === "cancelled") {
+		bits.push(theme.fg("warning", "cancelled"));
+	}
+	if (d.completion_notification === "armed") {
+		bits.push("wake armed");
 	}
 
 	// Log file path (shortened).

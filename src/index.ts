@@ -3,8 +3,8 @@
  * with pi's built-in `bash` tool's on-disk retention layered on top.
  *
  * Tools exposed to the LLM:
- *   - exec_command(cmd, workdir?, shell?, tty?, yield_time_ms?)
- *   - write_stdin(session_id, chars?, yield_time_ms?)
+ *   - exec_command(cmd, workdir?, shell?, tty?, yield_time_ms?, on_exit?)
+ *   - write_stdin(session_id, chars?, yield_time_ms?, yield_until?)
  *   - kill_session(session_id, signal?)          [pi-flavor; codex has no equivalent]
  *   - list_sessions()                            [pi-flavor]
  *
@@ -33,9 +33,18 @@ import {
 	truncateTail,
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type TUnsafe } from "typebox";
 
 import { collectOutputUntilDeadline } from "./collect.ts";
+import { CompletionCoordinator, type OnExitPolicy } from "./completion.ts";
+import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
+import {
+	DEFAULT_MAX_ABSOLUTE_WAIT_MS,
+	MAX_ABSOLUTE_WAIT_ENV_VAR,
+	nowUtcIso,
+	parseYieldUntil,
+	resolveMaxAbsoluteWaitMs,
+} from "./time.ts";
 import { sleep } from "./notify.ts";
 import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
 import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.ts";
@@ -50,8 +59,9 @@ const MIN_YIELD_TIME_MS = 250;
 const MAX_YIELD_TIME_MS = 30_000;
 const MIN_EMPTY_YIELD_TIME_MS = 5_000;
 // Diverges from codex (30 min): kept below Anthropic's 5-minute prompt-cache
-// TTL so a long empty poll never outlives the cached prompt prefix. Raise via
-// the env override below for cache-insensitive runs.
+// TTL so a long empty poll never outlives the cached prompt prefix. This is a
+// HARD cache-friendly ceiling: the env override below may lower it but never
+// raise the relative cap above 290 s — longer waits must use `yield_until`.
 const DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000;
 export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -60,8 +70,21 @@ const EARLY_EXIT_GRACE_PERIOD_MS = 150;
 const MAX_SESSIONS = 64;
 const WARNING_SESSIONS = 60;
 const LRU_PROTECTED_COUNT = 8;
-const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence
+const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence (relative waits only)
+// Absolute (`yield_until`) waits must not run the 250 ms heartbeat for hours;
+// output-driven TUI updates are rate-limited to this interval instead.
+const LONG_WAIT_UPDATE_INTERVAL_MS = 30_000;
+const DEFAULT_MAX_ABSOLUTE_WAIT_HOURS = DEFAULT_MAX_ABSOLUTE_WAIT_MS / 3_600_000;
 const SESSION_UI_KEY = "unified-exec.sessions";
+
+/**
+ * Google-compatible string enum schema (plain `type: "string"` + `enum`,
+ * mirroring pi-ai's StringEnum helper) — a TypeBox literal union (anyOf/const)
+ * breaks Google models.
+ */
+function StringEnum<T extends readonly string[]>(values: T, description: string): TUnsafe<T[number]> {
+	return Type.Unsafe<T[number]>({ type: "string", enum: values as unknown as string[], description });
+}
 
 // ---------------- Helpers ----------------
 
@@ -80,12 +103,29 @@ export function resolveMaxEmptyPollMs(env: NodeJS.ProcessEnv = process.env): num
 
 	const parsed = Number(raw);
 	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_BACKGROUND_POLL_MS;
-	return Math.max(MIN_EMPTY_YIELD_TIME_MS, Math.floor(parsed));
+	// The env var may LOWER the cap, but the effective cache-friendly maximum
+	// never exceeds 290 s — waits beyond that must use `yield_until`.
+	return clamp(Math.floor(parsed), MIN_EMPTY_YIELD_TIME_MS, DEFAULT_MAX_BACKGROUND_POLL_MS);
 }
 
-function clampEmptyPollYield(ms: number | undefined): number {
+/**
+ * Resolve the yield for an empty poll. Oversized values are REJECTED with an
+ * actionable error (including the host UTC time so the model can compute a
+ * `yield_until` deadline) instead of being silently clamped; undersized values
+ * keep the historical clamp-up-to-minimum behavior.
+ */
+function resolveEmptyPollYield(ms: number | undefined): number {
+	const cap = resolveMaxEmptyPollMs();
+	if (typeof ms === "number" && Math.floor(ms) > cap) {
+		throw new Error(
+			`write_stdin: yield_time_ms ${Math.floor(ms)} exceeds the empty-poll cap of ${cap} ms. ` +
+				`Waits longer than 290 seconds require \`yield_until\`: omit yield_time_ms and pass an absolute ` +
+				`UTC deadline such as "2026-07-21T18:30:00Z" (compute it from the current host time below). ` +
+				`tool_time_utc: ${nowUtcIso()}`,
+		);
+	}
 	const v = typeof ms === "number" && ms > 0 ? ms : DEFAULT_WRITE_STDIN_YIELD_MS;
-	return clamp(Math.floor(v), MIN_EMPTY_YIELD_TIME_MS, resolveMaxEmptyPollMs());
+	return clamp(Math.floor(v), MIN_EMPTY_YIELD_TIME_MS, cap);
 }
 
 /**
@@ -157,6 +197,16 @@ interface ResponseShape {
 	command?: string;
 	yield_time_ms?: number;
 	truncation?: TruncationResult;
+	// Long-wait / completion-notification metadata:
+	wait_mode?: "relative" | "absolute";
+	wait_status?: "completed" | "relative_deadline_reached" | "absolute_deadline_reached" | "cancelled";
+	yield_until?: string;
+	effective_wait_ms?: number;
+	on_exit?: OnExitPolicy;
+	completion_notification?: "armed";
+	completion_delivery?: "direct";
+	on_exit_wake?: "consumed";
+	tool_time_utc?: string;
 }
 
 function renderResponseText(shape: ResponseShape): string {
@@ -167,6 +217,15 @@ function renderResponseText(shape: ResponseShape): string {
 	if (shape.exit_code !== undefined) lines.push(`exit_code: ${shape.exit_code}`);
 	if (shape.signal) lines.push(`signal: ${shape.signal}`);
 	if (shape.failure_message) lines.push(`failure: ${shape.failure_message}`);
+	if (shape.wait_mode) lines.push(`wait_mode: ${shape.wait_mode}`);
+	if (shape.wait_status) lines.push(`wait_status: ${shape.wait_status}`);
+	if (shape.yield_until) lines.push(`yield_until: ${shape.yield_until}`);
+	if (shape.effective_wait_ms !== undefined) lines.push(`effective_wait_ms: ${shape.effective_wait_ms}`);
+	if (shape.on_exit) lines.push(`on_exit: ${shape.on_exit}`);
+	if (shape.completion_notification) lines.push(`completion_notification: ${shape.completion_notification}`);
+	if (shape.completion_delivery) lines.push(`completion_delivery: ${shape.completion_delivery}`);
+	if (shape.on_exit_wake) lines.push(`on_exit_wake: ${shape.on_exit_wake}`);
+	if (shape.tool_time_utc) lines.push(`tool_time_utc: ${shape.tool_time_utc}`);
 	if (shape.log_path) lines.push(`log_path: ${shape.log_path}`);
 	if (shape.cwd) lines.push(`cwd: ${shape.cwd}`);
 	lines.push(`wall_time_seconds: ${shape.wall_time_seconds.toFixed(3)}`);
@@ -184,6 +243,8 @@ function renderResponseText(shape: ResponseShape): string {
 
 interface ExtensionCtx {
 	store: SessionStore;
+	/** Agent-level wake scheduling for on_exit: "wake" (see completion.ts). */
+	coordinator: CompletionCoordinator;
 	ui: ExtensionContext["ui"] | undefined;
 	widgetVisible: boolean;
 	exitUnsubscribers: Map<number, () => void>;
@@ -205,6 +266,7 @@ type ExecCommandArgs = {
 	shell?: string;
 	tty?: boolean;
 	yield_time_ms?: number;
+	on_exit?: OnExitPolicy;
 };
 
 type WriteStdinArgs = {
@@ -212,6 +274,7 @@ type WriteStdinArgs = {
 	chars?: string;
 	chars_b64?: string;
 	yield_time_ms?: number;
+	yield_until?: string;
 };
 
 /**
@@ -290,6 +353,7 @@ async function runExecCommand(
 	const shellCommand = buildShellCommand(shellBin, args.cmd);
 	const effectiveCwd = args.workdir && args.workdir.length > 0 ? args.workdir : cwd;
 	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_EXEC_YIELD_MS);
+	const wantsWake = args.on_exit === "wake";
 
 	const id = ctx.store.allocateId();
 	const session = ExecSession.spawn(id, {
@@ -362,6 +426,7 @@ async function runExecCommand(
 			cwd: effectiveCwd,
 			command: args.cmd,
 			yieldTimeMs,
+			extra: { on_exit: args.on_exit },
 		});
 	}
 
@@ -371,6 +436,9 @@ async function runExecCommand(
 	watchSessionExit(ctx, session);
 	if (pruned) {
 		unwatchSessionExit(ctx, pruned.id);
+		// Suppresses the wake for live victims; keeps a tombstone for a
+		// naturally-exited wake session so its completion is not silently lost.
+		ctx.coordinator.handleEviction(pruned);
 		ctx.ui?.notify(`unified-exec: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
 	}
 	if (count >= WARNING_SESSIONS) {
@@ -400,6 +468,11 @@ async function runExecCommand(
 	const wallSec = (Date.now() - start) / 1000;
 
 	if (stillAlive) {
+		// COMMIT POINT for on_exit: "wake" — we are now returning a background
+		// session_id, so arm the wake. If the process exits a moment after this
+		// check, the coordinator's exit listener (which fires even for
+		// already-exited sessions) still delivers the completion exactly once.
+		if (wantsWake) ctx.coordinator.register(session);
 		return finalizeResponse({
 			wallTimeSec: wallSec,
 			collected,
@@ -412,9 +485,15 @@ async function runExecCommand(
 			cwd: effectiveCwd,
 			command: args.cmd,
 			yieldTimeMs,
+			extra: {
+				on_exit: args.on_exit,
+				...(wantsWake ? { completion_notification: "armed" as const } : {}),
+				tool_time_utc: nowUtcIso(),
+			},
 		});
 	}
-	// Process exited during this call → respond with exit info, not a session_id.
+	// Process exited during this call → respond with exit info, not a
+	// session_id. The wake is never armed: the exit was delivered directly.
 	removeSession(ctx, session.id);
 	return finalizeResponse({
 		wallTimeSec: wallSec,
@@ -428,6 +507,7 @@ async function runExecCommand(
 		cwd: effectiveCwd,
 		command: args.cmd,
 		yieldTimeMs,
+		extra: { on_exit: args.on_exit },
 	});
 	} finally {
 		ctx.pendingSessions.delete(session);
@@ -439,6 +519,7 @@ async function runWriteStdin(
 	args: WriteStdinArgs,
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	toolCallId: string,
 ): Promise<ResponseShape> {
 	const session = ctx.store.get(args.session_id);
 	if (!session) {
@@ -446,89 +527,325 @@ async function runWriteStdin(
 	}
 	const writeBytes = resolveWriteInput(args);
 	const isEmptyPoll = writeBytes === undefined || writeBytes.length === 0;
-	const yieldTimeMs = isEmptyPoll ? clampEmptyPollYield(args.yield_time_ms) : clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
+	const hasYieldUntil = typeof args.yield_until === "string" && args.yield_until.length > 0;
+
+	// `yield_time_ms` (relative, cache-friendly, ≤290 s) and `yield_until`
+	// (absolute UTC deadline) are never both accepted.
+	if (hasYieldUntil && args.yield_time_ms !== undefined) {
+		throw new Error(
+			`write_stdin: pass either yield_time_ms (relative wait, max ${resolveMaxEmptyPollMs()} ms) or ` +
+				`yield_until (absolute UTC deadline), not both. tool_time_utc: ${nowUtcIso()}`,
+		);
+	}
+	// `yield_until` is only valid for an empty poll (no input bytes).
+	if (hasYieldUntil && !isEmptyPoll) {
+		throw new Error(
+			`write_stdin: yield_until is only valid for an empty poll (no non-empty chars or chars_b64). ` +
+				`Send the input with a relative yield_time_ms first, then follow up with an empty yield_until poll. ` +
+				`tool_time_utc: ${nowUtcIso()}`,
+		);
+	}
+	if (hasYieldUntil) {
+		return runAbsoluteWait(ctx, session, args.yield_until!, signal, onUpdate, toolCallId);
+	}
+
+	const yieldTimeMs = isEmptyPoll
+		? resolveEmptyPollYield(args.yield_time_ms)
+		: clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
 
 	const start = Date.now();
 	session.touch();
 
-	let writeFailure: string | null = null;
-	if (!isEmptyPoll && writeBytes) {
-		const ok = session.write(writeBytes);
-		if (!ok && !session.hasExited) {
-			// Still running but stdin is gone (child closed it / EPIPE earlier).
-			writeFailure = "stdin write failed: the child closed its stdin; bytes were not delivered";
+	// Observation lease: while this call may return terminal status, a
+	// concurrent exit is held instead of enqueuing a wake (see completion.ts).
+	ctx.coordinator.beginObservation(session.id, toolCallId);
+	try {
+		let writeFailure: string | null = null;
+		if (!isEmptyPoll && writeBytes) {
+			const ok = session.write(writeBytes);
+			if (!ok && !session.hasExited) {
+				// Still running but stdin is gone (child closed it / EPIPE earlier).
+				writeFailure = "stdin write failed: the child closed its stdin; bytes were not delivered";
+			}
+			if (!ok && session.hasExited) {
+				// Session already exited; return its final state.
+				const collected = await collectOutputUntilDeadline({
+					buffer: session.outputBuffer,
+					outputNotify: session.outputNotify,
+					outputClosed: session.outputClosed,
+					exited: session.exited,
+					deadlineMs: Date.now() + 50,
+					externalAbort: signal,
+				});
+				const armed = ctx.coordinator.isArmed(session.id);
+				removeSession(ctx, session.id);
+				ctx.coordinator.markPendingTerminal(session.id, toolCallId);
+				const wallSec = (Date.now() - start) / 1000;
+				return finalizeResponse({
+					wallTimeSec: wallSec,
+					collected,
+					sessionId: undefined,
+					exitCode: session.exitCode,
+					signal: session.signal,
+					failure: session.failureMessage,
+					tty: session.tty,
+					logPath: session.logPath,
+					cwd: session.cwd,
+					command: session.displayCommand,
+					yieldTimeMs,
+					// This path is only reachable for input writes (never an empty
+					// poll), so no wait_mode is reported — just direct delivery.
+					extra: terminalWaitExtra(undefined, armed),
+				});
+			}
+			// Give the child a small window to react before the poll.
+			await sleep(100, signal);
 		}
-		if (!ok && session.hasExited) {
-			// Session already exited; return its final state.
-			const collected = await collectOutputUntilDeadline({
-				buffer: session.outputBuffer,
-				outputNotify: session.outputNotify,
-				outputClosed: session.outputClosed,
-				exited: session.exited,
-				deadlineMs: Date.now() + 50,
-				externalAbort: signal,
-			});
+
+		const deadlineMs = start + yieldTimeMs;
+		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
+		const collected = await collectOutputUntilDeadline({
+			buffer: session.outputBuffer,
+			outputNotify: session.outputNotify,
+			outputClosed: session.outputClosed,
+			exited: session.exited,
+			deadlineMs,
+			externalAbort: signal,
+		});
+		pollStream.stop();
+		const wallSec = (Date.now() - start) / 1000;
+
+		if (session.hasExited) {
+			const armed = ctx.coordinator.isArmed(session.id);
 			removeSession(ctx, session.id);
-			const wallSec = (Date.now() - start) / 1000;
+			// Terminal result constructed: keep the lease until Pi finalizes it
+			// (tool_execution_end) so an error/cancelled finalization keeps the
+			// completion wake-eligible.
+			ctx.coordinator.markPendingTerminal(session.id, toolCallId);
 			return finalizeResponse({
 				wallTimeSec: wallSec,
 				collected,
 				sessionId: undefined,
 				exitCode: session.exitCode,
 				signal: session.signal,
-				failure: session.failureMessage,
+				failure: session.failureMessage ?? writeFailure,
 				tty: session.tty,
 				logPath: session.logPath,
 				cwd: session.cwd,
 				command: session.displayCommand,
 				yieldTimeMs,
+				extra: terminalWaitExtra(isEmptyPoll ? "relative" : undefined, armed),
 			});
 		}
-		// Give the child a small window to react before the poll.
-		await sleep(100, signal);
-	}
-
-	const deadlineMs = start + yieldTimeMs;
-	const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-	const collected = await collectOutputUntilDeadline({
-		buffer: session.outputBuffer,
-		outputNotify: session.outputNotify,
-		outputClosed: session.outputClosed,
-		exited: session.exited,
-		deadlineMs,
-		externalAbort: signal,
-	});
-	pollStream.stop();
-	const wallSec = (Date.now() - start) / 1000;
-
-	if (session.hasExited) {
-		removeSession(ctx, session.id);
+		// Still running: release the lease WITHOUT marking observed — the wake
+		// (if armed) stays eligible.
+		const armed = ctx.coordinator.isArmed(session.id);
+		ctx.coordinator.releaseObservation(session.id, toolCallId);
 		return finalizeResponse({
 			wallTimeSec: wallSec,
 			collected,
-			sessionId: undefined,
-			exitCode: session.exitCode,
-			signal: session.signal,
-			failure: session.failureMessage ?? writeFailure,
+			sessionId: session.id,
+			exitCode: undefined,
+			signal: null,
+			failure: writeFailure,
 			tty: session.tty,
 			logPath: session.logPath,
 			cwd: session.cwd,
 			command: session.displayCommand,
 			yieldTimeMs,
+			extra: {
+				...(isEmptyPoll
+					? {
+							wait_mode: "relative" as const,
+							wait_status: signal?.aborted ? ("cancelled" as const) : ("relative_deadline_reached" as const),
+						}
+					: {}),
+				tool_time_utc: nowUtcIso(),
+				...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
+			},
+		});
+	} catch (err) {
+		// Handler failure: release the lease so the wake stays eligible.
+		ctx.coordinator.releaseObservation(session.id, toolCallId);
+		throw err;
+	}
+}
+
+/** Shared "exited" extra fields for direct terminal delivery. */
+function terminalWaitExtra(
+	waitMode: "relative" | "absolute" | undefined,
+	wakeWasArmed: boolean,
+): Partial<ResponseShape> {
+	return {
+		wait_mode: waitMode,
+		wait_status: waitMode ? ("completed" as const) : undefined,
+		completion_delivery: "direct",
+		tool_time_utc: nowUtcIso(),
+		...(wakeWasArmed ? { on_exit: "wake" as const, on_exit_wake: "consumed" as const } : {}),
+	};
+}
+
+/**
+ * Absolute-deadline wait (`yield_until`): stay attached, event-driven, until
+ * the process exits, the tool call is cancelled, or the UTC deadline arrives.
+ *
+ * Unlike relative polls this NEVER drains output while waiting (a 10-hour
+ * noisy process must not accumulate unbounded history in this call); the
+ * session machinery keeps its bounded head/tail buffer, rolling UI tail, and
+ * complete on-disk log.
+ */
+async function runAbsoluteWait(
+	ctx: ExtensionCtx,
+	session: ExecSession,
+	yieldUntilRaw: string,
+	signal: AbortSignal | undefined,
+	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	toolCallId: string,
+): Promise<ResponseShape> {
+	const startMs = Date.now();
+	// Parse/validate the wall-clock instant and compute the remaining duration
+	// ONCE; the wait below runs purely on the monotonic clock.
+	const parsed = parseYieldUntil(yieldUntilRaw, startMs, resolveMaxAbsoluteWaitMs());
+	session.touch();
+
+	// Observation lease (see completion.ts): exit is held while we observe.
+	ctx.coordinator.beginObservation(session.id, toolCallId);
+
+	// No 250 ms heartbeat for hours: one initial update, heavily rate-limited
+	// output-driven updates from a NON-destructive tail snapshot, one final.
+	const streamer = onUpdate
+		? startRateLimitedStream({
+				outputNotify: session.outputNotify,
+				minIntervalMs: LONG_WAIT_UPDATE_INTERVAL_MS,
+				emit: () => {
+					const tailText = decode(session.snapshotStreamTail());
+					onUpdate({
+						content: [{ type: "text", text: tailText }],
+						details: {
+							session_id: session.id,
+							pid: session.pid,
+							running: !session.hasExited,
+							total_bytes: session.totalBytesSeen,
+							tty: session.tty,
+							command: session.displayCommand,
+							cwd: session.cwd,
+							log_path: session.logPath,
+							yield_until: parsed.normalized,
+							output: tailText,
+						},
+					});
+				},
+			})
+		: undefined;
+
+	let outcome: LongWaitOutcome;
+	try {
+		outcome = await waitForExitOrDeadline({
+			exited: session.exited,
+			externalAbort: signal,
+			durationMs: parsed.remainingMs,
+		});
+	} catch (err) {
+		ctx.coordinator.releaseObservation(session.id, toolCallId);
+		streamer?.stop();
+		throw err;
+	}
+	streamer?.stop();
+
+	// Exit wins close races: if the session is already terminal when the result
+	// is assembled, deliver the terminal result regardless of which event won.
+	if (session.hasExited) outcome = "exit";
+	const armed = ctx.coordinator.isArmed(session.id);
+
+	if (outcome === "exit") {
+		// Let trailing stdout/stderr and the log flush settle (outputClosed),
+		// then drain the bounded retained output once. externalAbort is
+		// deliberately NOT passed: exit won, and the bounded final drain must
+		// complete even if cancellation fired at the same instant.
+		const collected = await collectOutputUntilDeadline({
+			buffer: session.outputBuffer,
+			outputNotify: session.outputNotify,
+			outputClosed: session.outputClosed,
+			exited: session.exited,
+			deadlineMs: Date.now() + 1000,
+		});
+		removeSession(ctx, session.id);
+		ctx.coordinator.markPendingTerminal(session.id, toolCallId);
+		return finalizeResponse({
+			wallTimeSec: (Date.now() - startMs) / 1000,
+			collected,
+			sessionId: undefined,
+			exitCode: session.exitCode,
+			signal: session.signal,
+			failure: session.failureMessage,
+			tty: session.tty,
+			logPath: session.logPath,
+			cwd: session.cwd,
+			command: session.displayCommand,
+			extra: {
+				...terminalWaitExtra("absolute", armed),
+				yield_until: parsed.normalized,
+			},
 		});
 	}
+
+	if (outcome === "cancelled") {
+		// Do NOT drain: if pi discards the result of a cancelled call, drained
+		// output would be lost. Buffered + logged output stays with the session,
+		// and the process survives. The wake (if armed) stays eligible.
+		ctx.coordinator.releaseObservation(session.id, toolCallId);
+		return finalizeResponse({
+			wallTimeSec: (Date.now() - startMs) / 1000,
+			collected: new Uint8Array(0),
+			sessionId: session.id,
+			exitCode: undefined,
+			signal: null,
+			failure: null,
+			tty: session.tty,
+			logPath: session.logPath,
+			cwd: session.cwd,
+			command: session.displayCommand,
+			extra: {
+				wait_mode: "absolute" as const,
+				wait_status: "cancelled" as const,
+				yield_until: parsed.normalized,
+				tool_time_utc: nowUtcIso(),
+				...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
+			},
+		});
+	}
+
+	// Absolute deadline reached while still running: one bounded drain
+	// (ordinary poll semantics), release the lease, keep the wake armed.
+	const collected = await collectOutputUntilDeadline({
+		buffer: session.outputBuffer,
+		outputNotify: session.outputNotify,
+		outputClosed: session.outputClosed,
+		exited: session.exited,
+		deadlineMs: Date.now(),
+		externalAbort: signal,
+	});
+	session.touch();
+	ctx.coordinator.releaseObservation(session.id, toolCallId);
 	return finalizeResponse({
-		wallTimeSec: wallSec,
+		wallTimeSec: (Date.now() - startMs) / 1000,
 		collected,
 		sessionId: session.id,
 		exitCode: undefined,
 		signal: null,
-		failure: writeFailure,
+		failure: null,
 		tty: session.tty,
 		logPath: session.logPath,
 		cwd: session.cwd,
 		command: session.displayCommand,
-		yieldTimeMs,
+		extra: {
+			wait_mode: "absolute" as const,
+			wait_status: "absolute_deadline_reached" as const,
+			yield_until: parsed.normalized,
+			effective_wait_ms: Date.now() - startMs,
+			tool_time_utc: nowUtcIso(),
+			...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
+		},
 	});
 }
 
@@ -556,6 +873,9 @@ async function terminateSessionById(
 ): Promise<TerminateOutcome | undefined> {
 	const session = ctx.store.get(sid);
 	if (!session) return undefined;
+	// Explicit kill (model tool or human slash command): suppress the wake
+	// BEFORE signaling so the induced exit can never race a wake enqueue.
+	ctx.coordinator.suppress(sid);
 	session.kill(initial);
 	// Wait up to 2s for exit.
 	const exitDeadline = Date.now() + 2000;
@@ -583,7 +903,14 @@ async function terminateSessionById(
 		deadlineMs: Date.now() + 100,
 	});
 	const killed = session.hasExited;
-	if (killed) removeSession(ctx, sid);
+	if (killed) {
+		ctx.coordinator.confirmKill(sid);
+		removeSession(ctx, sid);
+	} else {
+		// The kill did NOT land — the process is still alive and still owned.
+		// Restore its prior wake eligibility.
+		ctx.coordinator.restoreAfterFailedKill(sid);
+	}
 	return { session, escalated, finalOutput: decode(collected), killed };
 }
 
@@ -599,6 +926,8 @@ interface FinalizeInput {
 	cwd?: string;
 	command?: string;
 	yieldTimeMs?: number;
+	/** Long-wait / wake metadata merged into the shape (undefined values skipped). */
+	extra?: Partial<ResponseShape>;
 }
 
 function finalizeResponse(input: FinalizeInput): ResponseShape {
@@ -622,6 +951,11 @@ function finalizeResponse(input: FinalizeInput): ResponseShape {
 	if (command) shape.command = command;
 	if (yieldTimeMs) shape.yield_time_ms = yieldTimeMs;
 	if (truncation.truncated) shape.truncation = truncation;
+	if (input.extra) {
+		for (const [key, value] of Object.entries(input.extra)) {
+			if (value !== undefined) (shape as unknown as Record<string, unknown>)[key] = value;
+		}
+	}
 	return shape;
 }
 
@@ -773,7 +1107,29 @@ function startStreaming(
 }
 
 export default function (pi: ExtensionAPI) {
+	const coordinator = new CompletionCoordinator({
+		send: (message) => {
+			// If pi is idle this starts a model turn; if a run is active it is
+			// queued as a follow-up — never steering/interrupting the current turn.
+			pi.sendMessage(
+				{
+					customType: "unified-exec-completed",
+					content: message.content,
+					display: true,
+					details: message.details,
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+		},
+		onSendError: (err) => {
+			ctx.ui?.notify(
+				`unified-exec: failed to deliver completion notification: ${err instanceof Error ? err.message : String(err)}`,
+				"warning",
+			);
+		},
+	});
 	const ctx: ExtensionCtx = {
+		coordinator,
 		store: new SessionStore({
 			maxSessions: MAX_SESSIONS,
 			lruProtectedCount: LRU_PROTECTED_COUNT,
@@ -801,9 +1157,27 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
+	// Observation finalization: "observed" is committed at pi's finalized
+	// tool-result event, not merely when the handler returns — see completion.ts.
+	pi.on("tool_execution_end", async (event) => {
+		ctx.coordinator.handleToolExecutionEnd(event.toolCallId, event.isError === true);
+	});
+	// agent_settled (pi >= 0.80.5, our peer minimum) is a safe point to flush
+	// pending completions (e.g. retry a failed send). Wrapped so an older
+	// runtime that rejects unknown events degrades gracefully — wakes still
+	// deliver via the debounce timer and tool boundaries.
+	try {
+		pi.on("agent_settled", async () => {
+			ctx.coordinator.flushPending();
+		});
+	} catch {
+		// pi < 0.80.5: no agent_settled event — non-fatal.
+	}
+
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx.ui = eventCtx.ui;
 		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
+		ctx.coordinator.reset(); // never resurrect wakes from a previous session
 		updateRunningSessionsUi(ctx);
 		// Default behavior is to remove the built-in `bash` tool. Only keep it
 		// if --keep-builtin-bash was passed. Flag lookup uses the registered
@@ -835,6 +1209,9 @@ export default function (pi: ExtensionAPI) {
 		// including sessions still inside exec_command's early-exit grace
 		// window (spawned but not yet inserted into the store).
 		ctx.shuttingDown = true;
+		// Cancel wake timers/listeners first: no stale prompt may ever be
+		// injected into a new or closed session.
+		ctx.coordinator.shutdown();
 		const drained = ctx.store.terminateAll();
 		for (const s of ctx.pendingSessions) {
 			if (!s.hasExited) {
@@ -923,12 +1300,13 @@ export default function (pi: ExtensionAPI) {
 		name: "exec_command",
 		label: "exec_command",
 		description:
-			"Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms.",
+			"Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms. Pass on_exit: \"wake\" to get one follow-up notification when a backgrounded command exits unobserved.",
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
-			`For long-running non-interactive commands, start with a short yield to obtain a session_id, then monitor with one empty write_stdin poll up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 290 seconds, kept under Anthropic's 5-minute prompt-cache TTL; raise via ${MAX_EMPTY_POLL_ENV_VAR} for cache-insensitive runs) rather than repeated short polls.`,
+			`For long-running non-interactive commands, start with a short yield to obtain a session_id, then monitor with one empty write_stdin poll: use yield_time_ms for progress waits up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly), or yield_until (absolute UTC deadline, up to 10 h) for a deliberate longer wait on a finite non-interactive command.`,
+			'Use on_exit: "wake" when the command\'s completion should resume your task while no tool call is observing the session; combining it with yield_until is safe (direct completion consumes the wake; a deadline or cancellation leaves it armed). Do not use it for indefinite processes like dev servers.',
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
@@ -942,8 +1320,14 @@ export default function (pi: ExtensionAPI) {
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a PTY. Default false (plain pipes)." })),
 			yield_time_ms: Type.Optional(
 				Type.Number({
-					description: `How long (ms) to wait for output before yielding. Default ${DEFAULT_EXEC_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}].`,
+					description: `How long (ms) this call stays attached waiting for output before yielding — an attachment window, not the command's lifetime or completion timeout. Default ${DEFAULT_EXEC_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}].`,
 				}),
+			),
+			on_exit: Type.Optional(
+				StringEnum(
+					["none", "wake"] as const,
+					'Policy when the process exits while no tool call is observing it. "none" (default): poll with write_stdin. "wake": deliver ONE follow-up notification with bounded exit metadata that resumes the agent. A completion observed directly by a tool result consumes the wake.',
+				),
 			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
@@ -963,13 +1347,13 @@ export default function (pi: ExtensionAPI) {
 		name: "write_stdin",
 		label: "write_stdin",
 		description:
-			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary.",
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline for longer waits).",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
-			`For known long-running non-interactive jobs, avoid frequent polling. After exec_command returns a session_id, use write_stdin with no chars/chars_b64 and a long yield_time_ms up to the configured cap (default ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms / 290 seconds).`,
-			`Prefer one long empty poll over many short polls to avoid filling the conversation with repeated partial output; the default cap already stays within typical 5-minute prompt-cache expiry windows. Set ${MAX_EMPTY_POLL_ENV_VAR} higher (e.g. 1800000) for cache-insensitive runs.`,
-			"Use long empty polls for builds, test suites, installs, downloads, data processing, and other jobs that do not need interaction.",
-			"Do not use long polls for interactive sessions such as REPLs, sudo, ssh, password prompts, or commands where you may need to send input soon.",
+			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped.`,
+			'For a deliberate longer wait on a finite, non-interactive session (builds, test suites, installs, downloads, data processing), omit yield_time_ms and pass yield_until as a future UTC timestamp ending in "Z" (compute it from the tool_time_utc reported in tool results; max 10 h ahead). The call returns immediately when the process exits.',
+			'Use exec_command\'s on_exit: "wake" when completion should resume your task after no tool call is observing the session. Combining it with yield_until is safe: direct completion consumes the wake; a deadline or cancellation leaves it armed.',
+			"NEVER use yield_until for REPLs, sudo, ssh, password prompts, dev servers, file watchers, debuggers, or any indefinite/interactive session — it is only for finite commands that will exit on their own.",
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
@@ -988,13 +1372,18 @@ export default function (pi: ExtensionAPI) {
 			),
 			yield_time_ms: Type.Optional(
 				Type.Number({
-					description: `How long (ms) to wait for output before yielding. Default ${DEFAULT_WRITE_STDIN_YIELD_MS}; for empty input clamped to [${MIN_EMPTY_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}].`,
+					description: `How long (ms) this call stays attached before yielding — an attachment/progress window, not the process's lifetime or completion timeout. Default ${DEFAULT_WRITE_STDIN_YIELD_MS}; for empty input clamped to [${MIN_EMPTY_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}]; larger empty-poll values are rejected (use yield_until). Mutually exclusive with yield_until.`,
+				}),
+			),
+			yield_until: Type.Optional(
+				Type.String({
+					description: `Absolute UTC deadline to stay attached to an EMPTY poll, as strict RFC 3339 UTC ("2026-07-21T18:30:00Z" or with .mmm; uppercase Z, full date+time with seconds; no offsets). Returns immediately when the process exits. Only for finite non-interactive commands; max ${DEFAULT_MAX_ABSOLUTE_WAIT_HOURS} h ahead (${MAX_ABSOLUTE_WAIT_ENV_VAR}). Mutually exclusive with yield_time_ms and with input bytes.`,
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
+		async execute(toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any);
+			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any, toolCallId);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderResponseText(shape) }],
@@ -1084,6 +1473,10 @@ export default function (pi: ExtensionAPI) {
 			const reaped: ExecSession[] = [];
 			for (const s of ctx.store.values()) {
 				if (s.hasExited) {
+					// Reporting terminal completion here counts as direct observation:
+					// suppress a not-yet-queued wake (an already-queued wake stays a
+					// single notification — never a second one).
+					ctx.coordinator.observeViaListing(s.id);
 					removeSession(ctx, s.id);
 					reaped.push(s);
 				}
