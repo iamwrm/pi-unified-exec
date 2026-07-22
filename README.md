@@ -13,6 +13,13 @@ instead of a single blocking call the agent waits on.
 Mirrors codex's `exec_command` + `write_stdin` tool surface, with small
 pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
 
+> [!IMPORTANT]
+> **Maintenance notice:** We don't have the bandwidth to maintain this
+> repository for the community. Issues are disabled and external pull
+> requests are not accepted. If you'd like to improve or build on this
+> project, please **fork it** — it's [MIT licensed](./LICENSE), so you're
+> free to use, modify, and redistribute it.
+
 > **Install:**
 > ```bash
 > pi install npm:pi-unified-exec

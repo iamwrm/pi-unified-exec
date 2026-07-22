@@ -2,6 +2,21 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-22 — Maintenance notice
+
+- **README:** added a maintenance disclaimer — we don't have bandwidth to
+  maintain this repo for the community; issues are disabled and external PRs
+  are not accepted. Anyone wanting to improve it should fork (MIT license).
+- **GitHub settings (via `gh`):** disabled issues, projects, and wiki;
+  set interaction limits to `collaborators_only` (max GitHub allows:
+  6 months, expires 2027-01-22 — needs re-applying after expiry, since
+  GitHub does not support permanently disabling PRs on public repos).
+- **CI:** new `.github/workflows/interaction-limit-reminder.yml` — weekly
+  scheduled job that fails starting 7 days before the interaction-limit
+  expiry (hardcoded `EXPIRES_AT`, since `GITHUB_TOKEN` can't read the
+  interaction-limits API), reminding the owner to re-apply the limit and
+  bump the date.
+
 ## 2026-07-22 — 0.7.3
 
 ### Fixed
