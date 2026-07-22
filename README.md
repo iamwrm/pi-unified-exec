@@ -695,7 +695,7 @@ Supported — both pipes and PTY mode:
   `usr\bin\bash.exe`. Explicit `shell: "bash"` gets the same extended
   probe. Explicit `shell: "cmd"` (`/d /s /c`, verbatim command line —
   works in both pipe and tty mode) and `shell: "powershell"` / `"pwsh"`
-  (`-NoProfile -Command`) are supported. Bare shell names are resolved to
+  (`-NoProfile -NonInteractive -NoLogo -Command`) are supported. Bare shell names are resolved to
   an absolute path before spawning (failing closed if unresolvable), so a
   binary planted in an untrusted workdir can't shadow the real shell.
 - **No POSIX signals.** Every kill — `kill_session`, `/unified-exec-sessions`,
