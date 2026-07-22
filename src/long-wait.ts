@@ -17,6 +17,12 @@
 
 export type LongWaitOutcome = "exit" | "deadline" | "cancelled";
 
+/**
+ * Max single setTimeout arm. Values above ~2^31-1 overflow and fire early;
+ * multi-day yield_until waits re-arm in chunks of this size instead.
+ */
+export const MAX_TIMER_ARM_MS = 2_147_483_647; // 2^31 - 1
+
 export interface LongWaitInputs {
 	/** Aborts when the process has exited. */
 	exited: AbortSignal;
@@ -67,17 +73,20 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 			: new Promise<never>(() => {});
 
 		// Single timer, re-armed only if it fires before the monotonic deadline
-		// (e.g. coarse timer granularity). No polling loop, no per-chunk wakeups.
+		// (coarse timer granularity, or multi-day waits chunked below the
+		// setTimeout overflow ceiling). No polling loop, no per-chunk wakeups.
 		let timerHandle: unknown;
 		cleanups.push(() => {
 			if (timerHandle !== undefined) clearTimeoutFn(timerHandle);
 		});
 		const armTimer = (): Promise<void> =>
 			new Promise<void>((resolve) => {
+				const remaining = Math.max(1, monotonicDeadline - monotonicNow());
+				const armMs = Math.min(remaining, MAX_TIMER_ARM_MS);
 				timerHandle = setTimeoutFn(() => {
 					timerHandle = undefined;
 					resolve();
-				}, Math.max(1, monotonicDeadline - monotonicNow()));
+				}, armMs);
 			});
 
 		for (;;) {

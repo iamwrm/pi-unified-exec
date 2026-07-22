@@ -1,3 +1,5 @@
+import { formatElapsedShort } from "./format-time.ts";
+
 /**
  * CompletionCoordinator — agent-level completion scheduling for
  * `exec_command(on_exit: "wake")`, kept deliberately separate from the
@@ -58,7 +60,6 @@ export interface CompletionSnapshot {
 
 interface CompletionRecord {
 	sessionId: number;
-	policy: OnExitPolicy;
 	armed: boolean;
 	exited: boolean;
 	observed: boolean;
@@ -107,14 +108,6 @@ function oneLine(raw: string, max: number): string {
 	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
-function formatElapsedShort(ms: number): string {
-	const s = Math.max(0, Math.round(ms / 1000));
-	if (s < 60) return `${s}s`;
-	const m = Math.floor(s / 60);
-	if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
-	return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
-}
-
 export class CompletionCoordinator {
 	private readonly records = new Map<number, CompletionRecord>();
 	private readonly opts: Required<Pick<CompletionCoordinatorOptions, "send" | "debounceMs">> &
@@ -155,7 +148,6 @@ export class CompletionCoordinator {
 		if (this.records.has(session.id)) return;
 		const record: CompletionRecord = {
 			sessionId: session.id,
-			policy: "wake",
 			armed: true,
 			exited: false,
 			observed: false,
@@ -177,6 +169,41 @@ export class CompletionCoordinator {
 	isArmed(sessionId: number): boolean {
 		const r = this.records.get(sessionId);
 		return !!r && r.armed && !r.observed && !r.suppressed;
+	}
+
+	/**
+	 * Change on_exit policy by session id.
+	 *   - "none": disarm any pending wake record (including LRU tombstones that
+	 *     no longer have a store session). Does not kill the process.
+	 *   - "wake": arm auto-resume; requires a still-running `session` object.
+	 *
+	 * Disarm cannot recall a follow-up that `send` has already handed to pi.
+	 */
+	setOnExit(
+		sessionId: number,
+		policy: OnExitPolicy,
+		session?: CompletionSessionLike | null,
+	): "disarmed" | "already_none" | "armed" | "already_armed" | "too_late" {
+		if (this.stopped) return policy === "wake" ? "too_late" : "already_none";
+		const existing = this.records.get(sessionId);
+
+		if (policy === "none") {
+			if (!existing) return "already_none";
+			// Suppress even if a flush already reserved the wake but has not
+			// resolved the record yet — resolve drops it so flushPending skips it.
+			existing.suppressed = true;
+			this.resolveRecord(existing);
+			return "disarmed";
+		}
+
+		// policy === "wake"
+		if (existing) {
+			if (existing.observed || existing.suppressed) return "too_late";
+			return "already_armed";
+		}
+		if (!session || session.id !== sessionId || session.hasExited) return "too_late";
+		this.register(session);
+		return "armed";
 	}
 
 	private recordExit(record: CompletionRecord): void {
@@ -382,22 +409,33 @@ export class CompletionCoordinator {
 		// Reserve BEFORE sending so a re-entrant flush cannot double-schedule.
 		for (const r of eligible) r.wakeQueued = true;
 
-		const message = buildWakeMessage(eligible.map((r) => r.snapshot!));
+		// setOnExit("none") may disarm between reservation and send — drop those.
+		const deliver = eligible.filter((r) => !r.suppressed && !r.observed && this.records.has(r.sessionId));
+		if (deliver.length === 0) {
+			for (const r of eligible) r.wakeQueued = false;
+			return;
+		}
+
+		const message = buildWakeMessage(deliver.map((r) => r.snapshot!));
 		let sendResult: void | Promise<void>;
 		try {
 			sendResult = this.opts.send(message);
 		} catch (err) {
-			this.recoverFailedSend(eligible, err);
+			this.recoverFailedSend(deliver, err);
 			return;
 		}
 		if (sendResult && typeof (sendResult as Promise<void>).then === "function") {
 			(sendResult as Promise<void>)
 				.then(() => {
-					for (const r of eligible) this.resolveRecord(r);
+					for (const r of deliver) {
+						if (this.records.has(r.sessionId)) this.resolveRecord(r);
+					}
 				})
-				.catch((err) => this.recoverFailedSend(eligible, err));
+				.catch((err) => this.recoverFailedSend(deliver, err));
 		} else {
-			for (const r of eligible) this.resolveRecord(r);
+			for (const r of deliver) {
+				if (this.records.has(r.sessionId)) this.resolveRecord(r);
+			}
 		}
 	}
 

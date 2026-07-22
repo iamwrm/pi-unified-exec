@@ -19,6 +19,7 @@ import {
 	truncateToVisualLines,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { formatDurationSeconds, formatRemainingLater } from "./format-time.ts";
 
 type ExportedRenderCall<TState> = NonNullable<ToolDefinition<any, any, TState>["renderCall"]>;
 type ToolRenderContext<TState = any, TArgs = any> = Parameters<ExportedRenderCall<TState>>[2] & {
@@ -68,8 +69,11 @@ interface DetailsShape {
 	};
 }
 
-function formatDuration(ms: number): string {
-	return `${(ms / 1000).toFixed(1)}s`;
+/** Banner/footer label for an absolute wait: "2h40m later" (ISO kept in tool details). */
+function formatUntilLabel(yieldUntil: string, nowMs: number = Date.now()): string {
+	const targetMs = Date.parse(yieldUntil);
+	if (!Number.isFinite(targetMs)) return `until ${yieldUntil}`;
+	return formatRemainingLater(targetMs - nowMs);
 }
 
 /** Shorten `$HOME/foo/bar` → `~/foo/bar`; otherwise return as-is. */
@@ -109,6 +113,22 @@ export function renderExecCommandCall(
 	return text;
 }
 
+// ---------------- renderCall for set_on_exit ----------------
+
+export function renderSetOnExitCall(
+	args: { session_id?: number; on_exit?: string },
+	theme: Theme,
+	context: ToolRenderContext<RenderState, typeof args>,
+): Component {
+	const sid = args?.session_id !== undefined ? args.session_id : "?";
+	const pol = args?.on_exit ?? "?";
+	const banner =
+		theme.fg("toolTitle", theme.bold("set_on_exit")) + theme.fg("muted", ` session_id=${sid} → ${pol}`);
+	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+	text.setText(banner);
+	return text;
+}
+
 // ---------------- renderCall for write_stdin ----------------
 
 export function renderWriteStdinCall(
@@ -133,7 +153,7 @@ export function renderWriteStdinCall(
 			? theme.fg("toolTitle", theme.bold(`» ${stringifyChars(chars)}`))
 			: theme.fg("toolTitle", theme.bold(`» (base64, ${base64ByteLength(b64)} bytes)`));
 	const yieldSuffix = args?.yield_until
-		? theme.fg("muted", ` (until ${args.yield_until})`)
+		? theme.fg("muted", ` (${formatUntilLabel(args.yield_until)})`)
 		: yieldMs
 			? theme.fg("muted", ` (yield ${(yieldMs / 1000).toFixed(1)}s)`)
 			: "";
@@ -279,7 +299,7 @@ function buildStatusLine(
 	//   - done, session exited ............. "took"     (process finished)
 	if (state.startedAt !== undefined) {
 		const now = state.endedAt ?? Date.now();
-		const dur = formatDuration(now - state.startedAt);
+		const dur = formatDurationSeconds(now - state.startedAt);
 		let label: string;
 		if (options.isPartial) label = "elapsed";
 		else if (d.session_id !== undefined) label = "yielded";
@@ -300,10 +320,12 @@ function buildStatusLine(
 		bits.push(theme.fg("error", `failure: ${d.failure_message}`));
 	}
 
-	// Long-wait / wake state: which absolute deadline was in play, whether the
-	// wait was cancelled, and whether a completion notification is still armed.
-	if (d.yield_until && d.session_id !== undefined) {
-		bits.push(`until ${d.yield_until}`);
+	// Long-wait / wake state: human remaining countdown while attached to an
+	// absolute deadline, whether the wait was cancelled, and whether a
+	// completion notification is still armed. The 1s liveTicker keeps the
+	// "2h40m later" label fresh while options.isPartial.
+	if (d.yield_until && (options.isPartial || d.session_id !== undefined)) {
+		bits.push(formatUntilLabel(d.yield_until));
 	}
 	if (d.wait_status === "cancelled") {
 		bits.push(theme.fg("warning", "cancelled"));

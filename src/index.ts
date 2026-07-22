@@ -5,6 +5,7 @@
  * Tools exposed to the LLM:
  *   - exec_command(cmd, workdir?, shell?, tty?, yield_time_ms?, on_exit?)
  *   - write_stdin(session_id, chars?, yield_time_ms?, yield_until?)
+ *   - set_on_exit(session_id, on_exit)            [disarm/re-arm wake without kill]
  *   - kill_session(session_id, signal?)          [pi-flavor; codex has no equivalent]
  *   - list_sessions()                            [pi-flavor]
  *
@@ -38,16 +39,11 @@ import { Type, type TUnsafe } from "typebox";
 import { collectOutputUntilDeadline } from "./collect.ts";
 import { CompletionCoordinator, type OnExitPolicy } from "./completion.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
-import {
-	DEFAULT_MAX_ABSOLUTE_WAIT_MS,
-	MAX_ABSOLUTE_WAIT_ENV_VAR,
-	nowUtcIso,
-	parseYieldUntil,
-	resolveMaxAbsoluteWaitMs,
-} from "./time.ts";
+import { formatElapsed } from "./format-time.ts";
+import { nowUtcIso, parseYieldUntil } from "./time.ts";
 import { sleep } from "./notify.ts";
 import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
-import { renderExecCommandCall, renderResult, renderWriteStdinCall } from "./render.ts";
+import { renderExecCommandCall, renderResult, renderSetOnExitCall, renderWriteStdinCall } from "./render.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
 import { buildShellCommand, IS_WINDOWS, resolveDefaultShell, resolveWindowsShell } from "./shell.ts";
@@ -74,7 +70,6 @@ const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence (relative waits only)
 // Absolute (`yield_until`) waits must not run the 250 ms heartbeat for hours;
 // output-driven TUI updates are rate-limited to this interval instead.
 const LONG_WAIT_UPDATE_INTERVAL_MS = 30_000;
-const DEFAULT_MAX_ABSOLUTE_WAIT_HOURS = DEFAULT_MAX_ABSOLUTE_WAIT_MS / 3_600_000;
 const SESSION_UI_KEY = "unified-exec.sessions";
 
 /**
@@ -705,7 +700,7 @@ async function runAbsoluteWait(
 	const startMs = Date.now();
 	// Parse/validate the wall-clock instant and compute the remaining duration
 	// ONCE; the wait below runs purely on the monotonic clock.
-	const parsed = parseYieldUntil(yieldUntilRaw, startMs, resolveMaxAbsoluteWaitMs());
+	const parsed = parseYieldUntil(yieldUntilRaw, startMs);
 	session.touch();
 
 	// Observation lease (see completion.ts): exit is held while we observe.
@@ -970,32 +965,23 @@ function plural(n: number, singular: string, pluralForm = `${singular}s`): strin
 	return n === 1 ? singular : pluralForm;
 }
 
-function formatElapsed(ms: number): string {
-	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-	if (totalSeconds < 60) return `${totalSeconds}s`;
-	const totalMinutes = Math.floor(totalSeconds / 60);
-	if (totalMinutes < 60) return `${totalMinutes}m${String(totalSeconds % 60).padStart(2, "0")}s`;
-	const hours = Math.floor(totalMinutes / 60);
-	return `${hours}h${String(totalMinutes % 60).padStart(2, "0")}m`;
-}
-
 function oneLineCommand(command: string, max = 120): string {
 	const oneLine = command.replace(/\s+/g, " ").trim();
 	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
 }
 
-function formatRunningSessionsWidget(sessions: ExecSession[]): string[] {
+function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[]): string[] {
 	const now = Date.now();
 	const shown = sessions.slice(0, 5);
 	const lines = [
 		`⚠ unified-exec: ${sessions.length} ${plural(sessions.length, "session")} still running`,
-		...shown.map(
-			(s) =>
-				`  #${s.id} ${formatElapsed(now - s.startedAt)} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`,
-		),
+		...shown.map((s) => {
+			const wake = ctx.coordinator.isArmed(s.id) ? " ⏰wake" : "";
+			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
+		}),
 	];
 	if (sessions.length > shown.length) lines.push(`  … ${sessions.length - shown.length} more; use list_sessions`);
-	lines.push("  Use list_sessions for a fresh inventory, write_stdin to poll/drive, or kill_session to stop.");
+	lines.push("  Use list_sessions, write_stdin, set_on_exit (disarm wake), or kill_session.");
 	return lines;
 }
 
@@ -1027,7 +1013,7 @@ function updateRunningSessionsUi(ctx: ExtensionCtx, opts: { showWidget?: boolean
 	}
 
 	if (opts.showWidget || ctx.widgetVisible) {
-		setWidget.call(ui, SESSION_UI_KEY, formatRunningSessionsWidget(sessions), { placement: "aboveEditor" });
+		setWidget.call(ui, SESSION_UI_KEY, formatRunningSessionsWidget(ctx, sessions), { placement: "aboveEditor" });
 		ctx.widgetVisible = true;
 	}
 }
@@ -1268,9 +1254,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const now = Date.now();
-			const labels = sessions.map(
-				(s) => `#${s.id} ${formatElapsed(now - s.startedAt)} ${oneLineCommand(s.displayCommand, 60)}`,
-			);
+			const labels = sessions.map((s) => {
+				const wake = ctx.coordinator.isArmed(s.id) ? " ⏰wake" : "";
+				return `#${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 60)}`;
+			});
 			const KILL_ALL = `Kill all ${sessions.length} ${plural(sessions.length, "session")}`;
 			const choice = await cmdCtx.ui.select(
 				`unified-exec: ${sessions.length} live ${plural(sessions.length, "session")} — select to kill (Esc to cancel)`,
@@ -1300,13 +1287,13 @@ export default function (pi: ExtensionAPI) {
 		name: "exec_command",
 		label: "exec_command",
 		description:
-			"Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms. Pass on_exit: \"wake\" to get one follow-up notification when a backgrounded command exits unobserved.",
+			'Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms. on_exit defaults to "none". Only pass on_exit: "wake" when the human explicitly wants auto-resume on unobserved exit — stale wakes interrupt later work. Use set_on_exit to disarm or re-arm a running session.',
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
-			`For long-running non-interactive commands, start with a short yield to obtain a session_id, then monitor with one empty write_stdin poll: use yield_time_ms for progress waits up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly), or yield_until (absolute UTC deadline, up to 10 h) for a deliberate longer wait on a finite non-interactive command.`,
-			'Use on_exit: "wake" when the command\'s completion should resume your task while no tool call is observing the session; combining it with yield_until is safe (direct completion consumes the wake; a deadline or cancellation leaves it armed). Do not use it for indefinite processes like dev servers.',
+			`For background progress on long non-interactive commands, start with a short yield to obtain a session_id, then use empty write_stdin polls with yield_time_ms up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly); repeat polls as needed. Do NOT use yield_until just to bypass the 290s cap — only when the human explicitly asks for a long attached wait or a wall-clock deadline (finite non-interactive jobs only).`,
+			'on_exit defaults to "none". Prefer polling or human follow-up. Use on_exit: "wake" ONLY when the human explicitly wants auto-resume on unobserved completion — not for indefinite processes (dev servers, watchers). If you armed wake by mistake or the job is wrong/abandoned, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session still kills and suppresses wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
@@ -1326,7 +1313,7 @@ export default function (pi: ExtensionAPI) {
 			on_exit: Type.Optional(
 				StringEnum(
 					["none", "wake"] as const,
-					'Policy when the process exits while no tool call is observing it. "none" (default): poll with write_stdin. "wake": deliver ONE follow-up notification with bounded exit metadata that resumes the agent. A completion observed directly by a tool result consumes the wake.',
+					'"none" (default): no auto-resume; poll with write_stdin. "wake": ONE follow-up notification on unobserved exit that resumes the agent — only when the human explicitly wants auto-resume. Change later via set_on_exit. A completion observed directly by a tool result consumes the wake.',
 				),
 			),
 		}),
@@ -1347,13 +1334,13 @@ export default function (pi: ExtensionAPI) {
 		name: "write_stdin",
 		label: "write_stdin",
 		description:
-			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline for longer waits).",
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
-			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped.`,
-			'For a deliberate longer wait on a finite, non-interactive session (builds, test suites, installs, downloads, data processing), omit yield_time_ms and pass yield_until as a future UTC timestamp ending in "Z" (compute it from the tool_time_utc reported in tool results; max 10 h ahead). The call returns immediately when the process exits.',
-			'Use exec_command\'s on_exit: "wake" when completion should resume your task after no tool call is observing the session. Combining it with yield_until is safe: direct completion consumes the wake; a deadline or cancellation leaves it armed.',
+			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped. Repeat polls as needed instead of bypassing the cap.`,
+			'Use yield_until ONLY when the human explicitly asks for a long attached wait or an explicit UTC deadline. Omit yield_time_ms and pass a future UTC timestamp ending in "Z" (compute it from tool_time_utc in tool results). Finite non-interactive sessions only. Do NOT use yield_until just to bypass the 290s cap. The call returns immediately when the process exits.',
 			"NEVER use yield_until for REPLs, sudo, ssh, password prompts, dev servers, file watchers, debuggers, or any indefinite/interactive session — it is only for finite commands that will exit on their own.",
+			'on_exit wake is set via exec_command or set_on_exit, not write_stdin. Observing an exit here consumes an armed wake (direct result). To disarm wake without killing, call set_on_exit(session_id, on_exit: "none").',
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
@@ -1372,12 +1359,13 @@ export default function (pi: ExtensionAPI) {
 			),
 			yield_time_ms: Type.Optional(
 				Type.Number({
-					description: `How long (ms) this call stays attached before yielding — an attachment/progress window, not the process's lifetime or completion timeout. Default ${DEFAULT_WRITE_STDIN_YIELD_MS}; for empty input clamped to [${MIN_EMPTY_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}]; larger empty-poll values are rejected (use yield_until). Mutually exclusive with yield_until.`,
+					description: `How long (ms) this call stays attached before yielding — an attachment/progress window, not the process's lifetime or completion timeout. Default ${DEFAULT_WRITE_STDIN_YIELD_MS}; for empty input clamped to [${MIN_EMPTY_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}]; larger empty-poll values are rejected (use yield_until only if the human explicitly asked for a long wait). Mutually exclusive with yield_until.`,
 				}),
 			),
 			yield_until: Type.Optional(
 				Type.String({
-					description: `Absolute UTC deadline to stay attached to an EMPTY poll, as strict RFC 3339 UTC ("2026-07-21T18:30:00Z" or with .mmm; uppercase Z, full date+time with seconds; no offsets). Returns immediately when the process exits. Only for finite non-interactive commands; max ${DEFAULT_MAX_ABSOLUTE_WAIT_HOURS} h ahead (${MAX_ABSOLUTE_WAIT_ENV_VAR}). Mutually exclusive with yield_time_ms and with input bytes.`,
+					description:
+						'Absolute UTC deadline to stay attached to an EMPTY poll, as strict RFC 3339 UTC ("2026-07-21T18:30:00Z" or with .mmm; uppercase Z, full date+time with seconds; no offsets). Only when the human explicitly asks for a long attached wait. Returns immediately when the process exits. No default max horizon. Mutually exclusive with yield_time_ms and with input bytes.',
 				}),
 			),
 		}),
@@ -1395,10 +1383,72 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "set_on_exit",
+		label: "set_on_exit",
+		description:
+			'Change on_exit policy for a session without killing it. on_exit: "none" disarms a pending wake (including coordinator tombstones after eviction). on_exit: "wake" arms auto-resume if the process is still running. Cannot recall a follow-up already queued to the agent. kill_session both kills and suppresses.',
+		promptSnippet: "Disarm or re-arm on_exit wake for a session",
+		promptGuidelines: [
+			'Default on_exit is "none". If you set "wake" and no longer need auto-resume (wrong command, user moved on, abandoned approach), call set_on_exit with "none" promptly — do not leave stale wakes armed.',
+			"This does not stop the process. Use kill_session to terminate.",
+			"Prefer arming wake only when the human explicitly asked for auto-resume.",
+			"Disarm cannot recall a completion follow-up that was already delivered to pi.",
+		],
+		parameters: Type.Object({
+			session_id: Type.Number({ description: "Session id from exec_command." }),
+			on_exit: StringEnum(
+				["none", "wake"] as const,
+				'"none": disarm wake (process keeps running). "wake": arm auto-resume if still running.',
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, eventCtx) {
+			ctx.ui ??= eventCtx.ui;
+			const { session_id: sid, on_exit: policy } = params as { session_id: number; on_exit: OnExitPolicy };
+			const session = ctx.store.get(sid);
+			if (policy === "wake" && !session) {
+				return {
+					content: [{ type: "text", text: `No such session: ${sid}` }],
+					details: { session_id: sid, found: false },
+				};
+			}
+			const status = ctx.coordinator.setOnExit(sid, policy, session);
+			// unknown id: no store session and nothing to disarm
+			if (!session && status === "already_none") {
+				return {
+					content: [{ type: "text", text: `No such session: ${sid}` }],
+					details: { session_id: sid, found: false },
+				};
+			}
+			const running = session ? !session.hasExited : false;
+			const armed = ctx.coordinator.isArmed(sid);
+			const text =
+				`set_on_exit session_id=${sid} on_exit=${policy} → ${status}` +
+				(session ? (running ? " (process still running)" : " (process already exited)") : " (no store session; coordinator only)") +
+				(armed ? "; wake armed" : "; wake not armed");
+			return {
+				content: [{ type: "text", text }],
+				details: {
+					session_id: sid,
+					found: true,
+					on_exit: policy,
+					status,
+					running,
+					wake_armed: armed,
+					command: session?.displayCommand,
+					log_path: session?.logPath,
+					tool_time_utc: nowUtcIso(),
+				},
+			};
+		},
+		renderCall: renderSetOnExitCall as any,
+		renderResult: renderResult as any,
+	});
+
+	pi.registerTool({
 		name: "kill_session",
 		label: "kill_session",
 		description:
-			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after.",
+			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after. Also suppresses any armed on_exit wake.",
 		promptSnippet: "Terminate a session",
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session to terminate." }),
@@ -1495,6 +1545,7 @@ export default function (pi: ExtensionAPI) {
 					started_at_ms: s.startedAt,
 					elapsed_ms: now - s.startedAt,
 					running: !s.hasExited,
+					wake_armed: ctx.coordinator.isArmed(s.id),
 					exit_code: s.hasExited ? s.exitCode : undefined,
 					signal: s.hasExited ? (s.signal ?? undefined) : undefined,
 					failure_message: s.failureMessage ?? undefined,
@@ -1506,9 +1557,10 @@ export default function (pi: ExtensionAPI) {
 						const exitedSuffix = s.running
 							? ""
 							: `  [exited${s.exit_code !== undefined && s.exit_code !== null ? ` exit_code=${s.exit_code}` : ""}${s.signal ? ` signal=${s.signal}` : ""}; removed from store]`;
+						const wake = s.wake_armed ? " wake" : "";
 						return `  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
 							s.tty ? "tty" : "pipe"
-						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}  ${s.command.length > 60 ? s.command.slice(0, 60) + "…" : s.command}${exitedSuffix}\n        log: ${s.log_path}`;
+						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}  ${s.command.length > 60 ? s.command.slice(0, 60) + "…" : s.command}${exitedSuffix}\n        log: ${s.log_path}`;
 					})
 				: ["  (no live sessions)"];
 			const header = reaped.length

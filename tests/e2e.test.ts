@@ -401,7 +401,7 @@ describe("unified-exec e2e", () => {
 		if (!widgetContent) assert.fail(`widget=${JSON.stringify(widget)}`);
 		assert.ok(widgetContent[0].includes("1 session still running"), `widget=${JSON.stringify(widget)}`);
 		assert.ok(widgetContent.some((line) => line.includes(`#${sid}`)), `widget=${JSON.stringify(widget)}`);
-		assert.ok(widgetContent.some((line) => line.includes("write_stdin to poll/drive")));
+		assert.ok(widgetContent.some((line) => line.includes("set_on_exit") || line.includes("write_stdin")), `widget=${JSON.stringify(widget)}`);
 		assert.ok(
 			h.uiEvents.notifications.some((n) => n.type === "warning" && n.message.includes("still running after /tree")),
 			`notifications=${JSON.stringify(h.uiEvents.notifications)}`,

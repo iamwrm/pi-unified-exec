@@ -6,7 +6,7 @@
 
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { startRateLimitedStream, waitForExitOrDeadline } from "../src/long-wait.ts";
+import { MAX_TIMER_ARM_MS, startRateLimitedStream, waitForExitOrDeadline } from "../src/long-wait.ts";
 import { Notify } from "../src/notify.ts";
 
 describe("waitForExitOrDeadline", () => {
@@ -59,6 +59,31 @@ describe("waitForExitOrDeadline", () => {
 		});
 		assert.equal(outcome, "cancelled");
 		assert.equal(exited.signal.aborted, false);
+	});
+
+	it("chunks multi-day waits below the setTimeout overflow ceiling", async () => {
+		let mono = 0;
+		const armed: number[] = [];
+		const exited = new AbortController();
+		// 3× MAX_TIMER_ARM_MS requires at least 3 arms; each arm advances mono to the
+		// requested deadline chunk so the wait progresses without real multi-day delays.
+		const outcome = await waitForExitOrDeadline({
+			exited: exited.signal,
+			durationMs: MAX_TIMER_ARM_MS * 3,
+			monotonicNow: () => mono,
+			setTimeoutFn: (cb, ms) => {
+				armed.push(ms as number);
+				mono += ms as number;
+				return setTimeout(cb, 0);
+			},
+			clearTimeoutFn: (h) => clearTimeout(h as NodeJS.Timeout),
+		});
+		assert.equal(outcome, "deadline");
+		assert.ok(armed.length >= 3, `expected >=3 arms; got ${armed.length}`);
+		assert.ok(
+			armed.every((ms) => ms <= MAX_TIMER_ARM_MS),
+			`every arm must be ≤ MAX_TIMER_ARM_MS; got ${armed.join(",")}`,
+		);
 	});
 
 	it("runs on the monotonic clock: an early timer fire re-arms instead of ending the wait", async () => {

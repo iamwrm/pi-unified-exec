@@ -2,6 +2,69 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-22 — 0.7.2
+
+### Fixed / improved (post-review top 5)
+
+- **wake-e2e hygiene:** harnesses auto-`session_shutdown` in `afterEach`;
+  async-aware `waitFor`; fewer fixed long sleeps around debounce.
+- **`list_sessions` + widget + slash picker show `wake_armed` / `⏰wake`** so
+  agents and humans can audit which sessions will auto-resume.
+- **`set_on_exit` by coordinator id:** can disarm LRU tombstone wakes even when
+  the session is no longer in the store; unknown ids still return `found: false`.
+  Tool text notes disarm cannot recall an already-queued follow-up.
+- **Cleanup:** `src/format-time.ts` unifies duration labels; removed unused
+  `policy` field on completion records; `renderSetOnExitCall` for TUI.
+- **Tests:** tombstone disarm unit test; unknown sid + list `wake_armed` e2e.
+- **Docs refreshed:** README (`set_on_exit` tombstones/status tokens,
+  `wake_armed`, TUI remaining + `set_on_exit` banner, architecture +
+  `format-time.ts` + workspace docs), `docs/DEV.md` layout table, IV-0001
+  implementation map.
+
+## 2026-07-22 — 0.7.1
+
+### Added
+
+- **Agentic workspace docs:** `docs/DC-0001-agentic-workspace.md` (IV/DC
+  doctrine) and `docs/IV-0001-long-wait-and-wake-control.md` (this release’s
+  initiative: remaining-time TUI, human-explicit wait/wake guidance, horizon
+  removal, `set_on_exit`, evidence).
+- **`set_on_exit(session_id, on_exit)` tool.** Change a live session's
+  completion policy without killing it: `"none"` disarms a pending wake
+  (process keeps running); `"wake"` arms auto-resume if still running.
+  Disarm after exit but before the debounced wake flush also suppresses the
+  notification. Mid-flight flush re-checks suppression so a disarm cannot
+  race a reserved send. Status tokens: `disarmed`, `already_none`, `armed`,
+  `already_armed`, `too_late`.
+- **TUI remaining countdown for `yield_until`.** Call banners and streaming
+  footers show human remaining time (`2h40m later`, `12m later`, `45s later`,
+  `now`) instead of only the raw ISO deadline. ISO stays in tool result
+  metadata for the model. Shared helper: `formatRemainingLater` (now in
+  `src/format-time.ts` as of 0.7.2; still re-exported from `time.ts`).
+
+### Changed
+
+- **Removed the default 10 h `yield_until` horizon.** Any valid RFC 3339 UTC
+  future timestamp is accepted (past still = immediate poll). Dropped
+  `PI_UNIFIED_EXEC_MAX_ABSOLUTE_WAIT_MS`, `DEFAULT_MAX_ABSOLUTE_WAIT_MS`, and
+  `resolveMaxAbsoluteWaitMs`. Multi-day waits chunk `setTimeout` arms at
+  `MAX_TIMER_ARM_MS` (`2^31-1`) so timers never overflow.
+- **Tool guidance tightened against cache-busting and stale wakes.**
+  - `yield_until`: only when the human explicitly asks for a long attached
+    wait or wall-clock deadline — not to bypass the 290 s `yield_time_ms`
+    cap; repeat ≤290 s polls instead.
+  - `on_exit`: default remains `"none"`; use `"wake"` only when the human
+    explicitly wants auto-resume; if armed by mistake, `set_on_exit … none`
+    promptly. write_stdin no longer promotes wake.
+- **Docs** (README) updated for `set_on_exit`, human-explicit wait/wake
+  rules, no 10 h cap, and remaining-time TUI.
+
+### Tests
+
+- `formatRemainingLater` unit coverage; far-future `yield_until` accepted;
+  long-wait multi-arm chunking; CompletionCoordinator `setOnExit` paths;
+  wake-e2e: disarm failed job (0 wakes) and late-arm from `none` → 1 wake.
+
 ## 2026-07-21 — 0.7.0
 
 ### Added

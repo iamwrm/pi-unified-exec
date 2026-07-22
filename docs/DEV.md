@@ -5,8 +5,9 @@ and tool reference, see [../README.md](../README.md).
 
 ## Prerequisites
 
-- **Node 18+** (we use `AbortSignal`, `fetch`, native ESM with `.ts`
-  imports via [tsx](https://github.com/privatenumber/tsx)).
+- **Node ≥ 22.19** (see `package.json` `engines`; we use `AbortSignal`,
+  `fetch`, native ESM with `.ts` imports via
+  [tsx](https://github.com/privatenumber/tsx)).
 - **Linux, macOS, or Windows.** On Windows, Git Bash is strongly
   recommended (it's the default shell when on PATH; otherwise commands
   fall back to `powershell`). PTY mode uses ConPTY via the
@@ -50,9 +51,9 @@ npx tsc --noEmit                    # clean typecheck
 npx tsx --test tests/*.test.ts      # all tests (~10–15s)
 ```
 
-You should see `tests 178 … fail 0` (one test is skipped when no real
-`python3` is installed — e.g. on Windows, where the Store stub doesn't
-count).
+You should see on the order of **250+** tests with `fail 0` (a few skipped on
+non-Windows or when no real `python3` is installed — e.g. on Windows, where
+the Store stub doesn't count).
 
 ## Repo layout
 
@@ -61,12 +62,13 @@ sibling view, indexed by concern:
 
 | Concern | File(s) |
 |---|---|
-| Tool schemas, LLM-visible behavior | `src/index.ts` (tool registrations, `runExecCommand`, `runWriteStdin`) |
+| Tool schemas, LLM-visible behavior | `src/index.ts` (`exec_command`, `write_stdin`, `set_on_exit`, `kill_session`, `list_sessions`) |
 | Session lifecycle (spawn, write, kill, log-stream) | `src/session.ts` |
 | Session registry, LRU eviction, shutdown | `src/session-store.ts` |
 | The yield-until-deadline loop (relative polls) | `src/collect.ts` + `src/notify.ts` |
 | Absolute `yield_until` waits (event-driven, monotonic) | `src/long-wait.ts` + `src/time.ts` |
-| `on_exit: "wake"` completion scheduling (exactly-once) | `src/completion.ts` |
+| Human duration / remaining labels | `src/format-time.ts` (re-exported remaining helper from `time.ts`) |
+| `on_exit: "wake"` completion scheduling (exactly-once) | `src/completion.ts` (`setOnExit`, tombstones, flush) |
 | In-memory drain buffer | `src/head-tail-buffer.ts` |
 | On-disk log file mirroring | `src/session.ts` (`logStream`) |
 | Tail truncation for the LLM | `truncateTail` imported from `@earendil-works/pi-coding-agent` |
@@ -74,6 +76,7 @@ sibling view, indexed by concern:
 | PTY vs pipe spawning, Windows tree-kill | `src/pty.ts` |
 | Shell selection & argv construction | `src/shell.ts` |
 | TUI renderCall / renderResult | `src/render.ts` |
+| Initiative / doctrine docs | `docs/IV-*.md`, `docs/DC-*.md` |
 | Constants mirroring codex | top of `src/index.ts` |
 
 ## Dev loop

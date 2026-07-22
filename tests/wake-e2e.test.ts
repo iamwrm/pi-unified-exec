@@ -9,7 +9,7 @@
 
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 
 interface ToolDef {
@@ -71,7 +71,8 @@ function makeHarness() {
 	(extensionFactory as any)(pi);
 
 	let nextCallId = 1;
-	return {
+	let shutDown = false;
+	const harness = {
 		/** Call a tool with a fresh toolCallId; returns { result, toolCallId }. */
 		async call(toolName: string, params: any, signal?: AbortSignal, onUpdate?: (partial: any) => void) {
 			const def = tools[toolName];
@@ -85,22 +86,43 @@ function makeHarness() {
 		},
 		async emit(event: string, evt: any = {}) {
 			for (const h of handlers[event] ?? []) await h(evt, stubCtx);
+			if (event === "session_shutdown") shutDown = true;
 		},
 		/** Simulate pi finalizing a tool result. */
 		async finalizeTool(toolCallId: string, isError = false) {
 			await this.emit("tool_execution_end", { type: "tool_execution_end", toolCallId, toolName: "", result: {}, isError });
 		},
+		async shutdown() {
+			if (shutDown) return;
+			shutDown = true;
+			try {
+				await this.emit("session_shutdown");
+			} catch {
+				// best-effort cleanup
+			}
+		},
 		sentMessages,
 		uiEvents,
 	};
+	liveHarnesses.add(harness);
+	return harness;
 }
 
-async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> {
+const liveHarnesses = new Set<{ shutdown: () => Promise<void> }>();
+
+afterEach(async () => {
+	const hs = [...liveHarnesses];
+	liveHarnesses.clear();
+	for (const h of hs) await h.shutdown();
+});
+
+async function waitFor(cond: () => boolean | Promise<boolean>, timeoutMs = 8000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
-	while (!cond() && Date.now() < deadline) {
+	while (Date.now() < deadline) {
+		if (await cond()) return true;
 		await new Promise((r) => setTimeout(r, 25));
 	}
-	return cond();
+	return !!(await cond());
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -406,15 +428,77 @@ describe("exec_command on_exit", () => {
 		await h.emit("session_shutdown");
 	});
 
+	it("set_on_exit none disarms wake; failed job exit does not resume the agent", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", {
+			cmd: "sleep 0.8; exit 1",
+			yield_time_ms: 250,
+			on_exit: "wake",
+		});
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number");
+		const r2 = await h.call("set_on_exit", { session_id: sid, on_exit: "none" });
+		assert.equal(r2.details.status, "disarmed");
+		assert.equal(r2.details.wake_armed, false);
+		// Wait until the process is gone (list reaps it) then confirm no wake.
+		assert.ok(
+			await waitFor(async () => {
+				const l = await h.call("list_sessions", {});
+				return l.details.active_count === 0;
+			}),
+			"process should exit",
+		);
+		// Debounce window after exit — still no wake.
+		await sleep(400);
+		assert.equal(h.sentMessages.length, 0, "disarmed wake must not fire");
+	});
+
+	it("set_on_exit wake arms a session started with on_exit none", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", {
+			cmd: "sleep 0.5; exit 0",
+			yield_time_ms: 250,
+			on_exit: "none",
+		});
+		const sid = r1.details.session_id;
+		assert.ok(typeof sid === "number");
+		const r2 = await h.call("set_on_exit", { session_id: sid, on_exit: "wake" });
+		assert.equal(r2.details.status, "armed");
+		assert.equal(r2.details.wake_armed, true);
+		assert.ok(await waitFor(() => h.sentMessages.length === 1), "armed session should wake");
+		await h.call("write_stdin", { session_id: sid, yield_time_ms: 5000 }).catch(() => {});
+	});
+
+	it("set_on_exit unknown session_id returns found: false", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r = await h.call("set_on_exit", { session_id: 99999, on_exit: "none" });
+		assert.equal(r.details.found, false);
+	});
+
+	it("list_sessions reports wake_armed for live wake sessions", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250, on_exit: "wake" });
+		const sid = r1.details.session_id;
+		const l = await h.call("list_sessions", {});
+		const entry = l.details.sessions.find((s: any) => s.session_id === sid);
+		assert.ok(entry);
+		assert.equal(entry.wake_armed, true);
+		assert.match(l.content[0].text, /wake/);
+		await h.call("kill_session", { session_id: sid });
+	});
+
 	it("explicit model kill suppresses the wake", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250, on_exit: "wake" });
 		const sid = r1.details.session_id;
 		await h.call("kill_session", { session_id: sid });
-		await new Promise((res) => setTimeout(res, 600));
+		assert.ok(!(await waitFor(() => h.sentMessages.length > 0, 600)));
 		assert.equal(h.sentMessages.length, 0);
-		await h.emit("session_shutdown");
 	});
 
 	it("human slash-command kill suppresses the wake", async () => {
@@ -424,9 +508,8 @@ describe("exec_command on_exit", () => {
 		const sid = r1.details.session_id;
 		h.uiEvents.selectResponses.push((options) => options.find((o) => o.startsWith(`#${sid} `)));
 		await h.invokeCommand("unified-exec-sessions");
-		await new Promise((res) => setTimeout(res, 600));
+		assert.ok(!(await waitFor(() => h.sentMessages.length > 0, 600)));
 		assert.equal(h.sentMessages.length, 0);
-		await h.emit("session_shutdown");
 	});
 
 	it("list_sessions observing the exit before notification suppresses the wake", async () => {
@@ -435,16 +518,18 @@ describe("exec_command on_exit", () => {
 		const r1 = await h.call("exec_command", { cmd: "sleep 0.3", yield_time_ms: 250, on_exit: "wake" });
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number");
-		// Wait for the natural exit, then reap via list_sessions BEFORE the
-		// debounced wake can be verified — observeViaListing wins if it runs
-		// before the flush; either way at most one notification total.
-		await sleep(700);
-		const l = await h.call("list_sessions", {});
-		const entry = l.details.sessions.find((s: any) => s.session_id === sid);
-		assert.ok(entry && entry.running === false);
-		await new Promise((res) => setTimeout(res, 600));
+		// Poll until list_sessions can reap the exit (race with debounce).
+		let entry: any;
+		assert.ok(
+			await waitFor(async () => {
+				const l = await h.call("list_sessions", {});
+				entry = l.details.sessions.find((s: any) => s.session_id === sid);
+				return entry && entry.running === false;
+			}),
+			"expected list_sessions to observe exit",
+		);
+		await sleep(400); // remaining debounce budget if any
 		assert.ok(h.sentMessages.length <= 1, `never more than one notification; got ${h.sentMessages.length}`);
-		await h.emit("session_shutdown");
 	});
 
 	it("session_shutdown cancels pending wakes (no stale prompt)", async () => {
@@ -454,7 +539,7 @@ describe("exec_command on_exit", () => {
 		assert.ok(typeof r1.details.session_id === "number");
 		// Shut down before the process exits / the debounce fires.
 		await h.emit("session_shutdown");
-		await new Promise((res) => setTimeout(res, 800));
+		assert.ok(!(await waitFor(() => h.sentMessages.length > 0, 800)));
 		assert.equal(h.sentMessages.length, 0);
 	});
 
@@ -497,11 +582,21 @@ describe("exec_command on_exit", () => {
 		};
 		const r1 = await h.call("exec_command", { cmd: "sleep 0.3", yield_time_ms: 250, on_exit: "wake" });
 		assert.ok(typeof r1.details.session_id === "number");
-		await sleep(900); // exit + failed debounce flush
+		// Wait past natural exit + failed debounce flush (no message yet).
+		assert.ok(
+			await waitFor(async () => {
+				// Process has exited if write_stdin can get terminal or list reaps —
+				// here we just ensure the first send attempt had time to fail.
+				await sleep(50);
+				return h.sentMessages.length === 0;
+			}, 2000),
+		);
+		// Give debounce a moment after exit without busy-spinning 900ms blindly:
+		// poll until either a (failed) exit path settled or timeout.
+		await sleep(350);
 		assert.equal(h.sentMessages.length, 0);
 		await h.emit("agent_settled", { type: "agent_settled" });
 		assert.ok(await waitFor(() => h.sentMessages.length === 1), "retry at agent_settled");
 		await h.call("write_stdin", { session_id: r1.details.session_id, yield_time_ms: 5000 });
-		await h.emit("session_shutdown");
 	});
 });

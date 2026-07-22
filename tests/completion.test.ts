@@ -156,6 +156,62 @@ describe("CompletionCoordinator", () => {
 		assert.equal(sent.length, 1);
 	});
 
+	it("setOnExit none disarms an armed wake; natural exit does not notify", async () => {
+		const { coordinator, sent } = makeCoordinator();
+		const s = new FakeSession(1);
+		coordinator.register(s);
+		assert.equal(coordinator.setOnExit(1, "none", s), "disarmed");
+		assert.equal(coordinator.isArmed(1), false);
+		s.exit(1);
+		await settle();
+		assert.equal(sent.length, 0);
+		assert.equal(coordinator.setOnExit(1, "none", s), "already_none");
+	});
+
+	it("setOnExit wake arms a previously unarmed running session", async () => {
+		const { coordinator, sent } = makeCoordinator();
+		const s = new FakeSession(2);
+		assert.equal(coordinator.setOnExit(2, "wake", s), "armed");
+		assert.equal(coordinator.isArmed(2), true);
+		assert.equal(coordinator.setOnExit(2, "wake", s), "already_armed");
+		s.exit(0);
+		await settle();
+		assert.equal(sent.length, 1);
+	});
+
+	it("setOnExit wake is too_late after the session has already exited unregistered", async () => {
+		const { coordinator, sent } = makeCoordinator();
+		const s = new FakeSession(3);
+		s.exit(0);
+		assert.equal(coordinator.setOnExit(3, "wake", s), "too_late");
+		await settle();
+		assert.equal(sent.length, 0);
+	});
+
+	it("setOnExit none after exit but before flush suppresses the wake", async () => {
+		const { coordinator, sent } = makeCoordinator();
+		const s = new FakeSession(4);
+		coordinator.register(s);
+		s.exit(7);
+		// Debounce has not fired yet.
+		assert.equal(coordinator.setOnExit(4, "none", s), "disarmed");
+		await settle();
+		assert.equal(sent.length, 0);
+	});
+
+	it("setOnExit none disarms a tombstone record without a store session", async () => {
+		const { coordinator, sent } = makeCoordinator();
+		const s = new FakeSession(5);
+		coordinator.register(s);
+		s.exit(1);
+		// Evict exited session: tombstone keeps the pending wake.
+		coordinator.handleEviction(s);
+		// Disarm by id only (no live session object) — the set_on_exit tool path.
+		assert.equal(coordinator.setOnExit(5, "none", null), "disarmed");
+		await settle();
+		assert.equal(sent.length, 0);
+	});
+
 	it("explicit kill suppresses the wake before the exit lands", async () => {
 		const { coordinator, sent } = makeCoordinator();
 		const s = new FakeSession(1);

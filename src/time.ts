@@ -13,25 +13,15 @@
  * then run on a monotonic clock (see long-wait.ts) so later NTP adjustments
  * or manual system-clock changes cannot lengthen or shorten an in-progress
  * wait.
+ *
+ * There is no default maximum horizon: any valid future UTC timestamp is
+ * accepted. (Individual `setTimeout` arms are capped inside long-wait.ts so
+ * multi-day waits remain correct.)
  */
-
-/** Env override for the maximum absolute wait horizon. */
-export const MAX_ABSOLUTE_WAIT_ENV_VAR = "PI_UNIFIED_EXEC_MAX_ABSOLUTE_WAIT_MS";
-
-/** Default maximum absolute wait horizon: 10 hours. */
-export const DEFAULT_MAX_ABSOLUTE_WAIT_MS = 10 * 60 * 60 * 1000;
 
 /** Current host UTC time in ISO form — the trustworthy clock surfaced to the model. */
 export function nowUtcIso(nowMs: number = Date.now()): string {
 	return new Date(nowMs).toISOString();
-}
-
-export function resolveMaxAbsoluteWaitMs(env: NodeJS.ProcessEnv = process.env): number {
-	const raw = env[MAX_ABSOLUTE_WAIT_ENV_VAR]?.trim();
-	if (!raw) return DEFAULT_MAX_ABSOLUTE_WAIT_MS;
-	const parsed = Number(raw);
-	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_ABSOLUTE_WAIT_MS;
-	return Math.floor(parsed);
 }
 
 // Strict shape: YYYY-MM-DDTHH:MM:SS[.mmm]Z — uppercase Z only, 0–3 fraction digits.
@@ -51,12 +41,11 @@ export interface ParsedYieldUntil {
  * (always including the current host UTC time as `tool_time_utc`) on:
  *   - malformed / non-UTC / offset timestamps
  *   - impossible calendar dates
- *   - deadlines further out than `maxAbsoluteWaitMs` (never silently clamped)
  *
  * A deadline in the past is NOT an error: it yields `remainingMs: 0`
- * (an immediate poll).
+ * (an immediate poll). There is no maximum future horizon.
  */
-export function parseYieldUntil(raw: string, nowMs: number, maxAbsoluteWaitMs: number): ParsedYieldUntil {
+export function parseYieldUntil(raw: string, nowMs: number): ParsedYieldUntil {
 	const toolTime = nowUtcIso(nowMs);
 	const m = RFC3339_UTC_RE.exec(raw);
 	if (!m) {
@@ -93,19 +82,12 @@ export function parseYieldUntil(raw: string, nowMs: number, maxAbsoluteWaitMs: n
 		);
 	}
 
-	const remaining = targetMs - nowMs;
-	if (remaining > maxAbsoluteWaitMs) {
-		throw new Error(
-			`yield_until "${raw}" is ${Math.round(remaining / 1000)}s in the future, beyond the maximum ` +
-				`absolute wait horizon of ${maxAbsoluteWaitMs} ms (${Math.round(maxAbsoluteWaitMs / 3_600_000 * 10) / 10} h; ` +
-				`configurable via ${MAX_ABSOLUTE_WAIT_ENV_VAR}). Excessive deadlines are rejected, not clamped — ` +
-				`pass a nearer deadline and call again if the process is still running. tool_time_utc: ${toolTime}`,
-		);
-	}
-
 	return {
 		targetMs,
 		normalized: roundTrip.toISOString(),
-		remainingMs: Math.max(0, remaining),
+		remainingMs: Math.max(0, targetMs - nowMs),
 	};
 }
+
+// Remaining-time labels live in format-time.ts (shared with widgets / wake text).
+export { formatRemainingLater } from "./format-time.ts";
