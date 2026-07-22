@@ -2,6 +2,16 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-22 — 0.7.3
+
+### Fixed
+
+- **Windows PowerShell hang under Node 24 CI:** `buildShellCommand` now
+  passes `-NonInteractive -NoLogo` (with existing `-NoProfile -Command`) so
+  short `shell: "powershell"` commands exit when stdin is kept open as a pipe
+  for `write_stdin`. Fixes CI failure on `windows-latest` + Node 24 where
+  `Write-Output` never finished within the yield window.
+
 ## 2026-07-22 — 0.7.2
 
 ### Fixed / improved (post-review top 5)

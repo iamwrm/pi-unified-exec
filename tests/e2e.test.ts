@@ -117,11 +117,14 @@ describe("unified-exec e2e", () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		const r1 = await h.call("exec_command", { cmd: "Write-Output ps-ok", shell: "powershell", yield_time_ms: 20000 });
-		assert.ok(r1.details.output.includes("ps-ok"), `output=${r1.details.output}`);
-		assert.equal(r1.details.exit_code, 0);
+		assert.equal(r1.details.exit_code, 0, `powershell details=${JSON.stringify(r1.details)}`);
+		assert.ok(
+			r1.details.output.includes("ps-ok"),
+			`powershell output=${JSON.stringify(r1.details.output)} session_id=${r1.details.session_id}`,
+		);
 		const r2 = await h.call("exec_command", { cmd: "echo cmd-ok", shell: "cmd", yield_time_ms: 20000 });
-		assert.ok(r2.details.output.includes("cmd-ok"), `output=${r2.details.output}`);
-		assert.equal(r2.details.exit_code, 0);
+		assert.equal(r2.details.exit_code, 0, `cmd details=${JSON.stringify(r2.details)}`);
+		assert.ok(r2.details.output.includes("cmd-ok"), `cmd output=${JSON.stringify(r2.details.output)}`);
 		await h.emit("session_shutdown");
 	});
 

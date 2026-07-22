@@ -76,7 +76,10 @@ export function buildShellCommand(shellBin: string, cmd: string, isWindows: bool
 	}
 	// powershell/pwsh take -Command on every platform (pwsh is cross-platform).
 	if (base === "powershell" || base === "pwsh") {
-		return { command: [shellBin, "-NoProfile", "-Command", cmd] };
+		// -NonInteractive/-NoLogo: with stdin kept open as a pipe (for write_stdin),
+		// bare -Command can hang waiting for interactive input on some hosts
+		// (observed: Node 24 windows-latest CI). -NoProfile alone is not enough.
+		return { command: [shellBin, "-NoProfile", "-NonInteractive", "-NoLogo", "-Command", cmd] };
 	}
 	// bash, sh, zsh, fish, … all take -c.
 	return { command: [shellBin, "-c", cmd] };
