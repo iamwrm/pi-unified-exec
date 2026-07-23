@@ -2,6 +2,62 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-23 — 0.8.0
+
+### Fixed
+
+- **Silent data loss between polls is now visible to the model.** The 1 MiB
+  `HeadTailBuffer` drops middle bytes when a chatty process outruns polling;
+  previously the drained head+tail were spliced together with no trace. Now an
+  omission marker (`[... N bytes omitted here ... full stream is in the
+  session log file ...]`) is inserted at the exact drop point and the response
+  carries `omitted_bytes`. (`drainSegments()` in `head-tail-buffer.ts`;
+  `collectOutputUntilDeadline` returns `{ bytes, omittedBytes }`.)
+- **Empty-poll cap error message** no longer hardcodes "290 seconds" — it
+  interpolates the effective cap, which `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS`
+  may have lowered.
+- **Rolling TUI stream tail now trims a single oversized chunk.** A lone
+  chunk larger than the 32 KiB window previously bypassed the trim loop and
+  was shipped whole to the TUI every 250 ms tick.
+- **Widget / slash-picker command labels are control-char sanitized**
+  (`sanitizeMeta` in `oneLineCommand`) so ESC sequences can't reach the TUI.
+
+### Added
+
+- **`output_bytes_total`** in tool responses (cumulative bytes since spawn):
+  two polls with identical totals = stalled process, no drain needed.
+- **`cols` / `rows` params on `exec_command`** (tty only; clamped [20,500] /
+  [5,300]; defaults 120×30) — PTY geometry was previously hardcoded.
+- **`completion_delivery: "direct"` on exec_command's own exit paths** when
+  `on_exit: "wake"` was requested but the process exited within the call —
+  wake accounting is now auditable from the transcript alone (matches
+  write_stdin's direct-delivery metadata).
+- **`tool_time_utc` in `list_sessions`** (text trailer + details) so the
+  model can compute `yield_until` deadlines without an extra call.
+- **`[wake]` indicator in the `exec_command` call banner** (warning-colored)
+  when `on_exit: "wake"` is passed — the "this may interrupt you later" flag
+  is now visible at a glance. The widget, slash picker, and `list_sessions`
+  text now use the same `[wake]` token (previously `⏰wake` / `wake`).
+
+### Changed (internal refactors, no behavior change)
+
+- `ExecSession.collect()` wraps the buffer/notify/gate plumbing — seven
+  copy-pasted `collectOutputUntilDeadline({...})` call sites collapsed.
+- `kill_session` / `session_shutdown` waits are event-driven
+  (`waitForExitOrDeadline`) instead of 25–50 ms sleep-polling loops.
+- Shared `buildStreamUpdate()` for the two streaming-details builders.
+- Dead code removed: `SessionStore` id reservation (`reservedIds`,
+  `releaseId` — write-only state; ids are monotonic and never reused),
+  `ExecSession.snapshotState()`, `Notify.waiterCount`, `SpawnedChild.resize()`
+  (never callable; PTY geometry is set at spawn via `cols`/`rows`).
+- `pruneLru` uses one ascending sort instead of two.
+- TUI typing: `ui.setWidget` called through its real type (runtime-guarded),
+  and all `renderCall`/`renderResult` `as any` casts removed
+  (`renderSetOnExitCall` accepts `on_exit?: unknown` because the
+  Google-compatible `Type.Unsafe` enum's static type does not survive
+  inference).
+- `runExecCommand`'s grace-window `try` block re-indented; misc renames.
+
 ## 2026-07-23 — 0.7.4
 
 ### Changed

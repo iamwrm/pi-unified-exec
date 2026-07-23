@@ -36,8 +36,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TUnsafe } from "typebox";
 
-import { collectOutputUntilDeadline } from "./collect.ts";
-import { CompletionCoordinator, type OnExitPolicy } from "./completion.ts";
+import { CompletionCoordinator, type OnExitPolicy, sanitizeMeta } from "./completion.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { formatElapsed } from "./format-time.ts";
 import { nowUtcIso, parseYieldUntil } from "./time.ts";
@@ -67,6 +66,11 @@ const MAX_SESSIONS = 64;
 const WARNING_SESSIONS = 60;
 const LRU_PROTECTED_COUNT = 8;
 const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence (relative waits only)
+// PTY dimension clamps for exec_command's cols/rows (tty: true only).
+const MIN_PTY_COLS = 20;
+const MAX_PTY_COLS = 500;
+const MIN_PTY_ROWS = 5;
+const MAX_PTY_ROWS = 300;
 // Absolute (`yield_until`) waits must not run the 250 ms heartbeat for hours;
 // output-driven TUI updates are rate-limited to this interval instead.
 const LONG_WAIT_UPDATE_INTERVAL_MS = 30_000;
@@ -114,7 +118,7 @@ function resolveEmptyPollYield(ms: number | undefined): number {
 	if (typeof ms === "number" && Math.floor(ms) > cap) {
 		throw new Error(
 			`write_stdin: yield_time_ms ${Math.floor(ms)} exceeds the empty-poll cap of ${cap} ms. ` +
-				`Waits longer than 290 seconds require \`yield_until\`: omit yield_time_ms and pass an absolute ` +
+				`Waits longer than ${cap} ms require \`yield_until\`: omit yield_time_ms and pass an absolute ` +
 				`UTC deadline such as "2026-07-21T18:30:00Z" (compute it from the current host time below). ` +
 				`tool_time_utc: ${nowUtcIso()}`,
 		);
@@ -192,6 +196,10 @@ interface ResponseShape {
 	command?: string;
 	yield_time_ms?: number;
 	truncation?: TruncationResult;
+	/** Middle bytes dropped by the in-memory retention cap (a marker is spliced into `output`). */
+	omitted_bytes?: number;
+	/** Cumulative bytes this session has produced since spawn (progress/stall detection). */
+	output_bytes_total?: number;
 	// Long-wait / completion-notification metadata:
 	wait_mode?: "relative" | "absolute";
 	wait_status?: "completed" | "relative_deadline_reached" | "absolute_deadline_reached" | "cancelled";
@@ -226,6 +234,8 @@ function renderResponseText(shape: ResponseShape): string {
 	lines.push(`wall_time_seconds: ${shape.wall_time_seconds.toFixed(3)}`);
 	lines.push(`chunk_id: ${shape.chunk_id}`);
 	if (shape.original_token_count !== undefined) lines.push(`original_token_count: ${shape.original_token_count}`);
+	if (shape.output_bytes_total !== undefined) lines.push(`output_bytes_total: ${shape.output_bytes_total}`);
+	if (shape.omitted_bytes) lines.push(`omitted_bytes: ${shape.omitted_bytes}`);
 	if (shape.tty !== undefined) lines.push(`tty: ${shape.tty}`);
 	const header = lines.join("\n");
 	const body = shape.output || "(no output)";
@@ -260,6 +270,8 @@ type ExecCommandArgs = {
 	workdir?: string;
 	shell?: string;
 	tty?: boolean;
+	cols?: number;
+	rows?: number;
 	yield_time_ms?: number;
 	on_exit?: OnExitPolicy;
 };
@@ -356,13 +368,14 @@ async function runExecCommand(
 		cwd: effectiveCwd,
 		env: process.env,
 		tty,
+		cols: args.cols !== undefined ? clamp(Math.floor(args.cols), MIN_PTY_COLS, MAX_PTY_COLS) : undefined,
+		rows: args.rows !== undefined ? clamp(Math.floor(args.rows), MIN_PTY_ROWS, MAX_PTY_ROWS) : undefined,
 		displayCommand: args.cmd,
 		shell: shellBin,
 		windowsVerbatimArguments: shellCommand.windowsVerbatimArguments,
 	});
 
 	if (session.failureMessage) {
-		ctx.store.releaseId(id);
 		return finalizeResponse({
 			wallTimeSec: 0,
 			collected: new Uint8Array(0),
@@ -382,36 +395,112 @@ async function runExecCommand(
 	// be able to terminate children that are still inside the grace window.
 	ctx.pendingSessions.add(session);
 	try {
-	// Early-exit grace: if the process dies within 150 ms, treat it as a
-	// short-lived command and never register it.
-	const start = Date.now();
-	const earlyDeadline = start + EARLY_EXIT_GRACE_PERIOD_MS;
-	await Promise.race([
-		new Promise<void>((resolve) => {
-			if (session.hasExited) return resolve();
-			session.exited.addEventListener("abort", () => resolve(), { once: true });
-		}),
-		sleep(EARLY_EXIT_GRACE_PERIOD_MS, signal),
-	]);
+		// Early-exit grace: if the process dies within 150 ms, treat it as a
+		// short-lived command and never register it.
+		const start = Date.now();
+		const earlyDeadline = start + EARLY_EXIT_GRACE_PERIOD_MS;
+		await Promise.race([
+			new Promise<void>((resolve) => {
+				if (session.hasExited) return resolve();
+				session.exited.addEventListener("abort", () => resolve(), { once: true });
+			}),
+			sleep(EARLY_EXIT_GRACE_PERIOD_MS, signal),
+		]);
 
-	if (session.hasExited && Date.now() <= earlyDeadline + 20) {
-		// Fully short-lived: collect everything in the buffer + any trailing bytes.
-		// Use a small deadline to pick up anything still pending.
-		const collected = await collectOutputUntilDeadline({
-			buffer: session.outputBuffer,
-			outputNotify: session.outputNotify,
-			outputClosed: session.outputClosed,
-			exited: session.exited,
-			// macOS can deliver stdout/stderr shortly after the exit event for very
-			// fast commands. Give the trailing drain a bounded but less brittle window.
-			deadlineMs: Date.now() + 500,
-			externalAbort: signal,
-		});
-		ctx.store.releaseId(id);
+		if (session.hasExited && Date.now() <= earlyDeadline + 20) {
+			// Fully short-lived: collect everything in the buffer + any trailing
+			// bytes. macOS can deliver stdout/stderr shortly after the exit event
+			// for very fast commands — give the trailing drain a bounded window.
+			const collected = await session.collect({ deadlineMs: Date.now() + 500, externalAbort: signal });
+			const wallSec = (Date.now() - start) / 1000;
+			return finalizeResponse({
+				wallTimeSec: wallSec,
+				collected: collected.bytes,
+				omittedBytes: collected.omittedBytes,
+				totalBytes: session.totalBytesSeen,
+				sessionId: undefined,
+				exitCode: session.exitCode,
+				signal: session.signal,
+				failure: session.failureMessage,
+				tty,
+				logPath: session.logPath,
+				cwd: effectiveCwd,
+				command: args.cmd,
+				yieldTimeMs,
+				extra: {
+					on_exit: args.on_exit,
+					// Exit delivered in this very result: a requested wake is
+					// satisfied directly without ever being armed.
+					...(wantsWake ? { completion_delivery: "direct" as const, tool_time_utc: nowUtcIso() } : {}),
+				},
+			});
+		}
+
+		// Live session: register it BEFORE we keep polling, so an early abort
+		// doesn't let the session be GC'd / lose its place.
+		const { pruned, count } = ctx.store.insert(session);
+		watchSessionExit(ctx, session);
+		if (pruned) {
+			unwatchSessionExit(ctx, pruned.id);
+			// Suppresses the wake for live victims; keeps a tombstone for a
+			// naturally-exited wake session so its completion is not silently lost.
+			ctx.coordinator.handleEviction(pruned);
+			ctx.ui?.notify(`unified-exec: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
+		}
+		if (count >= WARNING_SESSIONS) {
+			ctx.ui?.notify(`unified-exec: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
+		}
+		// Note: sessions stay in the store until a later tool call observes the
+		// exit: write_stdin returns the final exit_code/output, and list_sessions
+		// reports exited sessions one last time (with exit info) before removing
+		// them. Matches codex's lazy-drain so exit information is never silently
+		// lost across turns.
+
+		// Wait until the yield deadline (or abort/exit). Stream updates meanwhile.
+		const deadlineMs = start + yieldTimeMs;
+		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
+		const collected = await session.collect({ deadlineMs, externalAbort: signal });
+		pollStream.stop();
+
+		session.touch();
+		const stillAlive = !session.hasExited;
 		const wallSec = (Date.now() - start) / 1000;
+
+		if (stillAlive) {
+			// COMMIT POINT for on_exit: "wake" — we are now returning a background
+			// session_id, so arm the wake. If the process exits a moment after this
+			// check, the coordinator's exit listener (which fires even for
+			// already-exited sessions) still delivers the completion exactly once.
+			if (wantsWake) ctx.coordinator.register(session);
+			return finalizeResponse({
+				wallTimeSec: wallSec,
+				collected: collected.bytes,
+				omittedBytes: collected.omittedBytes,
+				totalBytes: session.totalBytesSeen,
+				sessionId: session.id,
+				exitCode: undefined,
+				signal: null,
+				failure: null,
+				tty,
+				logPath: session.logPath,
+				cwd: effectiveCwd,
+				command: args.cmd,
+				yieldTimeMs,
+				extra: {
+					on_exit: args.on_exit,
+					...(wantsWake ? { completion_notification: "armed" as const } : {}),
+					tool_time_utc: nowUtcIso(),
+				},
+			});
+		}
+		// Process exited during this call → respond with exit info, not a
+		// session_id. The wake is never armed: the exit was delivered directly.
+		removeSession(ctx, session.id);
 		return finalizeResponse({
 			wallTimeSec: wallSec,
-			collected,
+			collected: collected.bytes,
+			omittedBytes: collected.omittedBytes,
+			totalBytes: session.totalBytesSeen,
 			sessionId: undefined,
 			exitCode: session.exitCode,
 			signal: session.signal,
@@ -421,89 +510,11 @@ async function runExecCommand(
 			cwd: effectiveCwd,
 			command: args.cmd,
 			yieldTimeMs,
-			extra: { on_exit: args.on_exit },
-		});
-	}
-
-	// Live session: register it BEFORE we keep polling, so an early abort
-	// doesn't let the session be GC'd / lose its place.
-	const { pruned, count } = ctx.store.insert(session);
-	watchSessionExit(ctx, session);
-	if (pruned) {
-		unwatchSessionExit(ctx, pruned.id);
-		// Suppresses the wake for live victims; keeps a tombstone for a
-		// naturally-exited wake session so its completion is not silently lost.
-		ctx.coordinator.handleEviction(pruned);
-		ctx.ui?.notify(`unified-exec: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
-	}
-	if (count >= WARNING_SESSIONS) {
-		ctx.ui?.notify(`unified-exec: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
-	}
-	// Note: sessions stay in the store until a later tool call observes the
-	// exit: write_stdin returns the final exit_code/output, and list_sessions
-	// reports exited sessions one last time (with exit info) before removing
-	// them. Matches codex's lazy-drain so exit information is never silently
-	// lost across turns.
-
-	// Wait until the yield deadline (or abort/exit). Stream updates meanwhile.
-	const deadlineMs = start + yieldTimeMs;
-	const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-	const collected = await collectOutputUntilDeadline({
-		buffer: session.outputBuffer,
-		outputNotify: session.outputNotify,
-		outputClosed: session.outputClosed,
-		exited: session.exited,
-		deadlineMs,
-		externalAbort: signal,
-	});
-	pollStream.stop();
-
-	session.touch();
-	const stillAlive = !session.hasExited;
-	const wallSec = (Date.now() - start) / 1000;
-
-	if (stillAlive) {
-		// COMMIT POINT for on_exit: "wake" — we are now returning a background
-		// session_id, so arm the wake. If the process exits a moment after this
-		// check, the coordinator's exit listener (which fires even for
-		// already-exited sessions) still delivers the completion exactly once.
-		if (wantsWake) ctx.coordinator.register(session);
-		return finalizeResponse({
-			wallTimeSec: wallSec,
-			collected,
-			sessionId: session.id,
-			exitCode: undefined,
-			signal: null,
-			failure: null,
-			tty,
-			logPath: session.logPath,
-			cwd: effectiveCwd,
-			command: args.cmd,
-			yieldTimeMs,
 			extra: {
 				on_exit: args.on_exit,
-				...(wantsWake ? { completion_notification: "armed" as const } : {}),
-				tool_time_utc: nowUtcIso(),
+				...(wantsWake ? { completion_delivery: "direct" as const, tool_time_utc: nowUtcIso() } : {}),
 			},
 		});
-	}
-	// Process exited during this call → respond with exit info, not a
-	// session_id. The wake is never armed: the exit was delivered directly.
-	removeSession(ctx, session.id);
-	return finalizeResponse({
-		wallTimeSec: wallSec,
-		collected,
-		sessionId: undefined,
-		exitCode: session.exitCode,
-		signal: session.signal,
-		failure: session.failureMessage,
-		tty,
-		logPath: session.logPath,
-		cwd: effectiveCwd,
-		command: args.cmd,
-		yieldTimeMs,
-		extra: { on_exit: args.on_exit },
-	});
 	} finally {
 		ctx.pendingSessions.delete(session);
 	}
@@ -564,21 +575,16 @@ async function runWriteStdin(
 			}
 			if (!ok && session.hasExited) {
 				// Session already exited; return its final state.
-				const collected = await collectOutputUntilDeadline({
-					buffer: session.outputBuffer,
-					outputNotify: session.outputNotify,
-					outputClosed: session.outputClosed,
-					exited: session.exited,
-					deadlineMs: Date.now() + 50,
-					externalAbort: signal,
-				});
+				const collected = await session.collect({ deadlineMs: Date.now() + 50, externalAbort: signal });
 				const armed = ctx.coordinator.isArmed(session.id);
 				removeSession(ctx, session.id);
 				ctx.coordinator.markPendingTerminal(session.id, toolCallId);
 				const wallSec = (Date.now() - start) / 1000;
 				return finalizeResponse({
 					wallTimeSec: wallSec,
-					collected,
+					collected: collected.bytes,
+					omittedBytes: collected.omittedBytes,
+					totalBytes: session.totalBytesSeen,
 					sessionId: undefined,
 					exitCode: session.exitCode,
 					signal: session.signal,
@@ -599,14 +605,7 @@ async function runWriteStdin(
 
 		const deadlineMs = start + yieldTimeMs;
 		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-		const collected = await collectOutputUntilDeadline({
-			buffer: session.outputBuffer,
-			outputNotify: session.outputNotify,
-			outputClosed: session.outputClosed,
-			exited: session.exited,
-			deadlineMs,
-			externalAbort: signal,
-		});
+		const collected = await session.collect({ deadlineMs, externalAbort: signal });
 		pollStream.stop();
 		const wallSec = (Date.now() - start) / 1000;
 
@@ -619,7 +618,9 @@ async function runWriteStdin(
 			ctx.coordinator.markPendingTerminal(session.id, toolCallId);
 			return finalizeResponse({
 				wallTimeSec: wallSec,
-				collected,
+				collected: collected.bytes,
+				omittedBytes: collected.omittedBytes,
+				totalBytes: session.totalBytesSeen,
 				sessionId: undefined,
 				exitCode: session.exitCode,
 				signal: session.signal,
@@ -638,7 +639,9 @@ async function runWriteStdin(
 		ctx.coordinator.releaseObservation(session.id, toolCallId);
 		return finalizeResponse({
 			wallTimeSec: wallSec,
-			collected,
+			collected: collected.bytes,
+			omittedBytes: collected.omittedBytes,
+			totalBytes: session.totalBytesSeen,
 			sessionId: session.id,
 			exitCode: undefined,
 			signal: null,
@@ -712,24 +715,7 @@ async function runAbsoluteWait(
 		? startRateLimitedStream({
 				outputNotify: session.outputNotify,
 				minIntervalMs: LONG_WAIT_UPDATE_INTERVAL_MS,
-				emit: () => {
-					const tailText = decode(session.snapshotStreamTail());
-					onUpdate({
-						content: [{ type: "text", text: tailText }],
-						details: {
-							session_id: session.id,
-							pid: session.pid,
-							running: !session.hasExited,
-							total_bytes: session.totalBytesSeen,
-							tty: session.tty,
-							command: session.displayCommand,
-							cwd: session.cwd,
-							log_path: session.logPath,
-							yield_until: parsed.normalized,
-							output: tailText,
-						},
-					});
-				},
+				emit: () => onUpdate(buildStreamUpdate(session, { yield_until: parsed.normalized })),
 			})
 		: undefined;
 
@@ -757,18 +743,14 @@ async function runAbsoluteWait(
 		// then drain the bounded retained output once. externalAbort is
 		// deliberately NOT passed: exit won, and the bounded final drain must
 		// complete even if cancellation fired at the same instant.
-		const collected = await collectOutputUntilDeadline({
-			buffer: session.outputBuffer,
-			outputNotify: session.outputNotify,
-			outputClosed: session.outputClosed,
-			exited: session.exited,
-			deadlineMs: Date.now() + 1000,
-		});
+		const collected = await session.collect({ deadlineMs: Date.now() + 1000 });
 		removeSession(ctx, session.id);
 		ctx.coordinator.markPendingTerminal(session.id, toolCallId);
 		return finalizeResponse({
 			wallTimeSec: (Date.now() - startMs) / 1000,
-			collected,
+			collected: collected.bytes,
+			omittedBytes: collected.omittedBytes,
+			totalBytes: session.totalBytesSeen,
 			sessionId: undefined,
 			exitCode: session.exitCode,
 			signal: session.signal,
@@ -792,6 +774,7 @@ async function runAbsoluteWait(
 		return finalizeResponse({
 			wallTimeSec: (Date.now() - startMs) / 1000,
 			collected: new Uint8Array(0),
+			totalBytes: session.totalBytesSeen,
 			sessionId: session.id,
 			exitCode: undefined,
 			signal: null,
@@ -812,19 +795,14 @@ async function runAbsoluteWait(
 
 	// Absolute deadline reached while still running: one bounded drain
 	// (ordinary poll semantics), release the lease, keep the wake armed.
-	const collected = await collectOutputUntilDeadline({
-		buffer: session.outputBuffer,
-		outputNotify: session.outputNotify,
-		outputClosed: session.outputClosed,
-		exited: session.exited,
-		deadlineMs: Date.now(),
-		externalAbort: signal,
-	});
+	const collected = await session.collect({ deadlineMs: Date.now(), externalAbort: signal });
 	session.touch();
 	ctx.coordinator.releaseObservation(session.id, toolCallId);
 	return finalizeResponse({
 		wallTimeSec: (Date.now() - startMs) / 1000,
-		collected,
+		collected: collected.bytes,
+		omittedBytes: collected.omittedBytes,
+		totalBytes: session.totalBytesSeen,
 		sessionId: session.id,
 		exitCode: undefined,
 		signal: null,
@@ -872,11 +850,8 @@ async function terminateSessionById(
 	// BEFORE signaling so the induced exit can never race a wake enqueue.
 	ctx.coordinator.suppress(sid);
 	session.kill(initial);
-	// Wait up to 2s for exit.
-	const exitDeadline = Date.now() + 2000;
-	while (!session.hasExited && Date.now() < exitDeadline) {
-		await sleep(50);
-	}
+	// Event-driven wait (resolves the instant the exit fires): up to 2s.
+	await waitForExitOrDeadline({ exited: session.exited, durationMs: 2000 });
 	let escalated = false;
 	// On Windows every kill is already a force tree-kill (taskkill /T /F);
 	// a "SIGKILL escalation" would spawn a byte-identical taskkill that
@@ -884,19 +859,10 @@ async function terminateSessionById(
 	if (!session.hasExited && !IS_WINDOWS) {
 		session.kill("SIGKILL");
 		escalated = true;
-		const kdeadline = Date.now() + 500;
-		while (!session.hasExited && Date.now() < kdeadline) {
-			await sleep(25);
-		}
+		await waitForExitOrDeadline({ exited: session.exited, durationMs: 500 });
 	}
 	// Final drain.
-	const collected = await collectOutputUntilDeadline({
-		buffer: session.outputBuffer,
-		outputNotify: session.outputNotify,
-		outputClosed: session.outputClosed,
-		exited: session.exited,
-		deadlineMs: Date.now() + 100,
-	});
+	const collected = await session.collect({ deadlineMs: Date.now() + 100 });
 	const killed = session.hasExited;
 	if (killed) {
 		ctx.coordinator.confirmKill(sid);
@@ -906,7 +872,7 @@ async function terminateSessionById(
 		// Restore its prior wake eligibility.
 		ctx.coordinator.restoreAfterFailedKill(sid);
 	}
-	return { session, escalated, finalOutput: decode(collected), killed };
+	return { session, escalated, finalOutput: decode(collected.bytes), killed };
 }
 
 interface FinalizeInput {
@@ -921,6 +887,10 @@ interface FinalizeInput {
 	cwd?: string;
 	command?: string;
 	yieldTimeMs?: number;
+	/** Middle bytes dropped by the retention cap during this call's drain. */
+	omittedBytes?: number;
+	/** Cumulative bytes the session has produced since spawn. */
+	totalBytes?: number;
 	/** Long-wait / wake metadata merged into the shape (undefined values skipped). */
 	extra?: Partial<ResponseShape>;
 }
@@ -945,6 +915,8 @@ function finalizeResponse(input: FinalizeInput): ResponseShape {
 	if (cwd) shape.cwd = cwd;
 	if (command) shape.command = command;
 	if (yieldTimeMs) shape.yield_time_ms = yieldTimeMs;
+	if (input.omittedBytes) shape.omitted_bytes = input.omittedBytes;
+	if (input.totalBytes !== undefined) shape.output_bytes_total = input.totalBytes;
 	if (truncation.truncated) shape.truncation = truncation;
 	if (input.extra) {
 		for (const [key, value] of Object.entries(input.extra)) {
@@ -966,7 +938,9 @@ function plural(n: number, singular: string, pluralForm = `${singular}s`): strin
 }
 
 function oneLineCommand(command: string, max = 120): string {
-	const oneLine = command.replace(/\s+/g, " ").trim();
+	// sanitizeMeta strips control chars (ESC included) — \s+ alone would let
+	// terminal escape sequences through to widgets and pickers.
+	const oneLine = sanitizeMeta(command).replace(/\s+/g, " ").trim();
 	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
 }
 
@@ -976,7 +950,7 @@ function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[])
 	const lines = [
 		`⚠ unified-exec: ${sessions.length} ${plural(sessions.length, "session")} still running`,
 		...shown.map((s) => {
-			const wake = ctx.coordinator.isArmed(s.id) ? " ⏰wake" : "";
+			const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
 			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
 		}),
 	];
@@ -999,21 +973,19 @@ function updateRunningSessionsUi(ctx: ExtensionCtx, opts: { showWidget?: boolean
 		);
 	}
 
-	const setWidget = (ui as any).setWidget as
-		| ((key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void)
-		| undefined;
-	if (!setWidget) return;
+	// Runtime-guarded for older hosts, but typed (pi >= 0.80.5 ships setWidget).
+	if (typeof ui.setWidget !== "function") return;
 
 	if (sessions.length === 0) {
 		if (ctx.widgetVisible) {
-			setWidget.call(ui, SESSION_UI_KEY, undefined);
+			ui.setWidget(SESSION_UI_KEY, undefined);
 			ctx.widgetVisible = false;
 		}
 		return;
 	}
 
 	if (opts.showWidget || ctx.widgetVisible) {
-		setWidget.call(ui, SESSION_UI_KEY, formatRunningSessionsWidget(ctx, sessions), { placement: "aboveEditor" });
+		ui.setWidget(SESSION_UI_KEY, formatRunningSessionsWidget(ctx, sessions), { placement: "aboveEditor" });
 		ctx.widgetVisible = true;
 	}
 }
@@ -1046,6 +1018,31 @@ function clearSessionExitWatchers(ctx: ExtensionCtx): void {
 	ctx.exitUnsubscribers.clear();
 }
 
+/** Shared streaming-update payload (relative polls and absolute waits). */
+function buildStreamUpdate(
+	session: ExecSession,
+	extra?: Record<string, unknown>,
+): { content: [{ type: "text"; text: string }]; details: unknown } {
+	const tailText = decode(session.snapshotStreamTail());
+	return {
+		content: [{ type: "text", text: tailText }],
+		details: {
+			session_id: session.id,
+			pid: session.pid,
+			running: !session.hasExited,
+			total_bytes: session.totalBytesSeen,
+			tty: session.tty,
+			command: session.displayCommand,
+			cwd: session.cwd,
+			log_path: session.logPath,
+			// Populate `output` so renderResult has a single source regardless
+			// of streaming vs final state.
+			output: tailText,
+			...extra,
+		},
+	};
+}
+
 function startStreaming(
 	session: ExecSession,
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
@@ -1054,40 +1051,24 @@ function startStreaming(
 ): { stop: () => void } {
 	if (!onUpdate) return { stop: () => {} };
 	let stopped = false;
+	let timer: NodeJS.Timeout | undefined;
 	const tick = () => {
 		if (stopped) return;
 		try {
-			const tail = session.snapshotStreamTail();
-			const tailText = decode(tail);
-			onUpdate({
-				content: [{ type: "text", text: tailText }],
-				details: {
-					session_id: session.id,
-					pid: session.pid,
-					running: !session.hasExited,
-					total_bytes: session.totalBytesSeen,
-					tty: session.tty,
-					command: session.displayCommand,
-					cwd: session.cwd,
-					log_path: session.logPath,
-					// Populate `output` so renderResult has a single source regardless
-					// of streaming vs final state.
-					output: tailText,
-				},
-			});
+			onUpdate(buildStreamUpdate(session));
 		} catch {
 			// ignore transient errors
 		}
 		if (stopped) return;
 		if (Date.now() >= deadlineMs) return;
 		if (externalAbort?.aborted) return;
-		interval = setTimeout(tick, OUTPUT_POLL_INTERVAL_MS);
+		timer = setTimeout(tick, OUTPUT_POLL_INTERVAL_MS);
 	};
-	let interval: NodeJS.Timeout | undefined = setTimeout(tick, OUTPUT_POLL_INTERVAL_MS);
+	timer = setTimeout(tick, OUTPUT_POLL_INTERVAL_MS);
 	return {
 		stop: () => {
 			stopped = true;
-			if (interval) clearTimeout(interval);
+			if (timer) clearTimeout(timer);
 		},
 	};
 }
@@ -1116,15 +1097,9 @@ export default function (pi: ExtensionAPI) {
 	});
 	const ctx: ExtensionCtx = {
 		coordinator,
-		store: new SessionStore({
-			maxSessions: MAX_SESSIONS,
-			lruProtectedCount: LRU_PROTECTED_COUNT,
-			onEvict: (s, reason) => {
-				if (reason === "lru") {
-					// Status clear + warning handled at insert-site; no-op here.
-				}
-			},
-		}),
+		// Eviction UI (status clear + warning) is handled at the insert site;
+		// no onEvict callback needed.
+		store: new SessionStore({ maxSessions: MAX_SESSIONS, lruProtectedCount: LRU_PROTECTED_COUNT }),
 		ui: undefined,
 		widgetVisible: false,
 		exitUnsubscribers: new Map(),
@@ -1212,20 +1187,13 @@ export default function (pi: ExtensionAPI) {
 		// SIGKILL survivors and wait briefly for confirmation. On Windows the
 		// initial kill is already a force tree-kill and a second taskkill is
 		// byte-identical, so skip the escalation there (the grace wait above
-		// still confirms exits).
-		const graceDeadline = Date.now() + 1000;
-		while (drained.some((s) => !s.hasExited) && Date.now() < graceDeadline) {
-			await sleep(50);
-		}
+		// still confirms exits). Event-driven per session: each wait resolves
+		// the instant that session's exit fires.
+		await Promise.all(drained.map((s) => waitForExitOrDeadline({ exited: s.exited, durationMs: 1000 })));
 		if (!IS_WINDOWS) {
 			const survivors = drained.filter((s) => !s.hasExited);
 			for (const s of survivors) s.kill("SIGKILL");
-			if (survivors.length) {
-				const killDeadline = Date.now() + 500;
-				while (drained.some((s) => !s.hasExited) && Date.now() < killDeadline) {
-					await sleep(25);
-				}
-			}
+			await Promise.all(survivors.map((s) => waitForExitOrDeadline({ exited: s.exited, durationMs: 500 })));
 		}
 		if (drained.length && ctx.ui) {
 			const leftover = drained.filter((s) => !s.hasExited).length;
@@ -1255,7 +1223,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const now = Date.now();
 			const labels = sessions.map((s) => {
-				const wake = ctx.coordinator.isArmed(s.id) ? " ⏰wake" : "";
+				const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
 				return `#${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 60)}`;
 			});
 			const KILL_ALL = `Kill all ${sessions.length} ${plural(sessions.length, "session")}`;
@@ -1305,6 +1273,16 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a PTY. Default false (plain pipes)." })),
+			cols: Type.Optional(
+				Type.Number({
+					description: `PTY width in columns (tty: true only; ignored for pipes). Default 120, clamped to [${MIN_PTY_COLS}, ${MAX_PTY_COLS}].`,
+				}),
+			),
+			rows: Type.Optional(
+				Type.Number({
+					description: `PTY height in rows (tty: true only; ignored for pipes). Default 30, clamped to [${MIN_PTY_ROWS}, ${MAX_PTY_ROWS}].`,
+				}),
+			),
 			yield_time_ms: Type.Optional(
 				Type.Number({
 					description: `How long (ms) this call stays attached waiting for output before yielding — an attachment window, not the command's lifetime or completion timeout. Default ${DEFAULT_EXEC_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}].`,
@@ -1326,8 +1304,8 @@ export default function (pi: ExtensionAPI) {
 				details: shape,
 			};
 		},
-		renderCall: renderExecCommandCall as any,
-		renderResult: renderResult as any,
+		renderCall: renderExecCommandCall,
+		renderResult,
 	});
 
 	pi.registerTool({
@@ -1378,8 +1356,8 @@ export default function (pi: ExtensionAPI) {
 				details: shape,
 			};
 		},
-		renderCall: renderWriteStdinCall as any,
-		renderResult: renderResult as any,
+		renderCall: renderWriteStdinCall,
+		renderResult,
 	});
 
 	pi.registerTool({
@@ -1440,8 +1418,8 @@ export default function (pi: ExtensionAPI) {
 				},
 			};
 		},
-		renderCall: renderSetOnExitCall as any,
-		renderResult: renderResult as any,
+		renderCall: renderSetOnExitCall,
+		renderResult,
 	});
 
 	pi.registerTool({
@@ -1552,12 +1530,13 @@ export default function (pi: ExtensionAPI) {
 					output_bytes_total: s.totalBytesSeen,
 					log_path: s.logPath,
 				}));
+			const toolTimeUtc = nowUtcIso();
 			const lines = sessions.length
 				? sessions.map((s) => {
 						const exitedSuffix = s.running
 							? ""
 							: `  [exited${s.exit_code !== undefined && s.exit_code !== null ? ` exit_code=${s.exit_code}` : ""}${s.signal ? ` signal=${s.signal}` : ""}; removed from store]`;
-						const wake = s.wake_armed ? " wake" : "";
+						const wake = s.wake_armed ? " [wake]" : "";
 						return `  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
 							s.tty ? "tty" : "pipe"
 						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}  ${s.command.length > 60 ? s.command.slice(0, 60) + "…" : s.command}${exitedSuffix}\n        log: ${s.log_path}`;
@@ -1567,8 +1546,10 @@ export default function (pi: ExtensionAPI) {
 				? `unified-exec sessions (${live.length} live, ${reaped.length} just exited):`
 				: `unified-exec sessions (${live.length}):`;
 			return {
-				content: [{ type: "text", text: `${header}\n${lines.join("\n")}` }],
-				details: { sessions, active_count: live.length },
+				// tool_time_utc lets the model compute a yield_until deadline from a
+				// trustworthy host clock without an extra probing call.
+				content: [{ type: "text", text: `${header}\n${lines.join("\n")}\ntool_time_utc: ${toolTimeUtc}` }],
+				details: { sessions, active_count: live.length, tool_time_utc: toolTimeUtc },
 			};
 		},
 	});

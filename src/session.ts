@@ -14,6 +14,7 @@ import { closeSync, createWriteStream, openSync, type WriteStream } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { type CollectResult, collectOutputUntilDeadline } from "./collect.ts";
 import { HeadTailBuffer } from "./head-tail-buffer.ts";
 import { Gate, Notify } from "./notify.ts";
 import { type SpawnedChild, spawnChild } from "./pty.ts";
@@ -195,6 +196,14 @@ export class ExecSession {
 	}
 
 	private appendStreamTail(chunk: Uint8Array): void {
+		// A single chunk larger than the whole window replaces it outright —
+		// the trim loop below never shrinks a lone chunk, and shipping a
+		// multi-megabyte "tail" to the TUI every tick defeats the cap.
+		if (chunk.length >= this.streamTailCap) {
+			this.streamTail = [chunk.subarray(chunk.length - this.streamTailCap)];
+			this.streamTailBytes = this.streamTailCap;
+			return;
+		}
 		this.streamTail.push(chunk);
 		this.streamTailBytes += chunk.length;
 		while (this.streamTailBytes > this.streamTailCap && this.streamTail.length > 1) {
@@ -268,6 +277,23 @@ export class ExecSession {
 		return out;
 	}
 
+	/**
+	 * Drain this session's retained output until `deadlineMs` (or exit/abort).
+	 * Thin wrapper over collectOutputUntilDeadline so call sites don't repeat
+	 * the buffer/notify/gate plumbing.
+	 */
+	collect(opts: { deadlineMs: number; externalAbort?: AbortSignal; postExitCloseWaitMs?: number }): Promise<CollectResult> {
+		return collectOutputUntilDeadline({
+			buffer: this.outputBuffer,
+			outputNotify: this.outputNotify,
+			outputClosed: this.outputClosed,
+			exited: this.exited,
+			deadlineMs: opts.deadlineMs,
+			externalAbort: opts.externalAbort,
+			postExitCloseWaitMs: opts.postExitCloseWaitMs,
+		});
+	}
+
 	/** Write bytes to stdin. Returns true on success, false if closed/dead. */
 	write(data: Uint8Array): boolean {
 		if (this.state.hasExited) return false;
@@ -278,11 +304,6 @@ export class ExecSession {
 	kill(signal: NodeJS.Signals = "SIGTERM"): void {
 		if (this.state.hasExited) return;
 		this.child.kill(signal);
-	}
-
-	/** Snapshot the current state. */
-	snapshotState(): SessionState {
-		return { ...this.state };
 	}
 
 	get hasExited(): boolean {

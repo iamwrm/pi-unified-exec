@@ -140,6 +140,23 @@ describe("HeadTailBuffer", () => {
 		assert.throws(() => new HeadTailBuffer(NaN));
 	});
 
+	it("drainSegments preserves the head/tail split and omitted count, then resets", () => {
+		const buf = new HeadTailBuffer(10); // 5 head + 5 tail
+		buf.pushChunk(s("01234")); // head
+		buf.pushChunk(s("XXXXXXXXXX")); // overflows tail: middle dropped
+		buf.pushChunk(s("abcde")); // final tail
+		const seg = buf.drainSegments();
+		const headText = new TextDecoder().decode(Uint8Array.from(seg.head.flatMap((c) => [...c])));
+		const tailText = new TextDecoder().decode(Uint8Array.from(seg.tail.flatMap((c) => [...c])));
+		assert.equal(headText, "01234");
+		assert.equal(tailText, "abcde");
+		assert.ok(seg.omittedBytes > 0);
+		// Drain resets everything.
+		assert.equal(buf.retainedBytes, 0);
+		assert.equal(buf.omittedBytes, 0);
+		assert.deepEqual(buf.drainChunks(), []);
+	});
+
 	it("copies input so caller mutations do not affect state", () => {
 		const buf = new HeadTailBuffer(10);
 		const chunk = s("01234");

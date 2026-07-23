@@ -21,6 +21,19 @@ import type { Gate, Notify } from "./notify.ts";
 
 const POST_EXIT_CLOSE_WAIT_MS = 50;
 
+const markerEncoder = new TextEncoder();
+
+/**
+ * Marker spliced into the collected payload at the exact position where the
+ * HeadTailBuffer dropped middle bytes, so the model never mistakes
+ * head+tail as contiguous output. The full stream is always in the log file.
+ */
+function omissionMarker(omittedBytes: number, retentionBytes: number): Uint8Array {
+	return markerEncoder.encode(
+		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-memory retention between polls; the full stream is in the session log file) ...]\n`,
+	);
+}
+
 export interface CollectInputs {
 	/** Buffer to drain. Chunks removed from it are returned to the caller. */
 	buffer: HeadTailBuffer;
@@ -38,18 +51,28 @@ export interface CollectInputs {
 	postExitCloseWaitMs?: number;
 }
 
+/** Collected payload plus how many middle bytes the retention cap dropped. */
+export interface CollectResult {
+	/** Concatenated bytes, with an omission marker spliced in when bytes were dropped. */
+	bytes: Uint8Array;
+	/** Total middle bytes dropped by the HeadTailBuffer across this call's drains. */
+	omittedBytes: number;
+}
+
 /**
  * Collect all currently-buffered bytes, then keep waiting for more until the
- * deadline or a break condition. Returns the concatenated byte payload.
+ * deadline or a break condition. Returns the concatenated byte payload plus
+ * the omitted-middle-byte count (marker spliced at each omission point).
  *
  * The buffer is drained non-destructively to the process output pipe — new
  * output arriving after we return stays in the buffer for the next collect().
  */
-export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise<Uint8Array> {
+export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise<CollectResult> {
 	const { buffer, outputNotify, outputClosed, exited, deadlineMs, externalAbort } = inputs;
 	const postExitCloseWaitCap = inputs.postExitCloseWaitMs ?? POST_EXIT_CLOSE_WAIT_MS;
 
 	const collected: Uint8Array[] = [];
+	let omittedTotal = 0;
 	let exitSignalReceived = exited.aborted;
 	let postExitDeadline: number | undefined;
 
@@ -75,9 +98,10 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 			if (externalAbort?.aborted) break;
 
 			// 1) Drain whatever is currently buffered.
-			const drained = buffer.drainChunks();
+			const drained = buffer.drainSegments();
+			const drainedCount = drained.head.length + drained.tail.length;
 
-			if (drained.length === 0) {
+			if (drainedCount === 0 && drained.omittedBytes === 0) {
 				if (exited.aborted) exitSignalReceived = true;
 				if (exitSignalReceived && outputClosed.isClosed) break;
 
@@ -114,8 +138,14 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 				continue;
 			}
 
-			// 2) Collected some bytes — keep them and loop.
-			for (const chunk of drained) collected.push(chunk);
+			// 2) Collected some bytes — keep them (marker spliced at the exact
+			// head/tail boundary when the retention cap dropped middle bytes).
+			for (const chunk of drained.head) collected.push(chunk);
+			if (drained.omittedBytes > 0) {
+				omittedTotal += drained.omittedBytes;
+				collected.push(omissionMarker(drained.omittedBytes, buffer.maxBytes));
+			}
+			for (const chunk of drained.tail) collected.push(chunk);
 
 			if (exited.aborted) exitSignalReceived = true;
 			if (Date.now() >= deadlineMs) break;
@@ -124,7 +154,7 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 		for (const cleanup of cleanups) cleanup();
 	}
 
-	return concat(collected);
+	return { bytes: concat(collected), omittedBytes: omittedTotal };
 }
 
 /**

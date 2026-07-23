@@ -51,7 +51,7 @@ attached waits should work (with safe `setTimeout` chunking).
 | Horizon removal | `src/time.ts` | `parseYieldUntil(raw, nowMs)` — no max arg. Dropped env/constants. |
 | Long timer arms | `src/long-wait.ts` | `MAX_TIMER_ARM_MS`; re-arm loop. |
 | Policy change | `src/completion.ts` → `setOnExit(id, policy, session?)` | By-id disarm (tombstones); status tokens; flushPending deliver filter. |
-| Wake audit | `list_sessions` / widget / slash picker | `wake_armed` / `⏰wake`. |
+| Wake audit | `list_sessions` / widget / slash picker | `wake_armed` / `[wake]`. |
 | Tool surface | `src/index.ts` | `set_on_exit` tool + renderer; rewritten `promptGuidelines`. |
 | Docs | `README.md`, `Changelog.md`, this IV, `DC-0001` | Rules + API tables + workspace doctrine. |
 | Tests | `tests/time.test.ts`, `long-wait.test.ts`, `completion.test.ts`, `wake-e2e.test.ts`, `e2e.test.ts` | Unit + pipeline; wake-e2e `afterEach` shutdown. |
@@ -123,7 +123,7 @@ guidance over-promotes wake + no undo path + `triggerTurn: true` on late exit.
 
 - Optional wake TTL if stale resumes remain common even with guidance + disarm.
 - Human slash-command action for `set_on_exit` (picker currently kill-only;
-  wake is now visible as `⏰wake`).
+  wake is now visible as `[wake]`).
 - Soften `triggerTurn` for very old completions (product choice).
 - liveTicker cleanup if TUI drops a streaming component mid-wait (P3).
 

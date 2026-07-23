@@ -46,7 +46,7 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   nothing is observing it — completions seen directly by a tool result
   consume the wake instead. `set_on_exit` disarms or re-arms wake without
   killing the process (including coordinator tombstones after eviction);
-  `list_sessions` and the running-session UI surface `wake_armed` / `⏰wake`.
+  `list_sessions` and the running-session UI surface `wake_armed` / `[wake]`.
 - **Ctrl-C and other control bytes, not just stdin text.**
   `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
   `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
@@ -103,6 +103,8 @@ Runs a command in a persistent session.
 | `workdir` | string | turn cwd | Working directory. |
 | `shell` | string | `bash` | Shell binary. On Windows: `bash` if on PATH, else `powershell`. `cmd` / `powershell` / `pwsh` get shell-appropriate flags. |
 | `tty` | boolean | `false` | Allocate a PTY (requires node-pty). |
+| `cols` | number | `120` | PTY width in columns (`tty: true` only; ignored for pipes). Clamped to [20, 500]. |
+| `rows` | number | `30` | PTY height in rows (`tty: true` only; ignored for pipes). Clamped to [5, 300]. |
 | `yield_time_ms` | number | `10_000` | How long this call stays attached waiting for output (an attachment window, not the command's lifetime), clamped to [250, 30_000]. |
 | `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. Prefer `"none"`. `"wake"`: one synthetic follow-up prompt resumes the agent — only when the human explicitly wants auto-resume. Change later with `set_on_exit`. |
 
@@ -118,9 +120,19 @@ cwd: /home/you/project
 wall_time_seconds: 0.502
 chunk_id: a4f2c1
 original_token_count: 37
+output_bytes_total: 148            (cumulative bytes since spawn — compare across polls to detect stalls)
+omitted_bytes: 0                   (only present when the 1 MiB in-memory retention dropped middle bytes)
 tty: false
 ---
 <captured stdout+stderr>
+```
+
+If a chatty process produces more than the 1 MiB in-memory retention between
+polls, the middle is dropped and a marker is spliced at the exact omission
+point (the full stream is always in `log_path`):
+
+```
+[... 3145728 bytes omitted here (output exceeded the 1048576-byte in-memory retention between polls; the full stream is in the session log file) ...]
 ```
 
 When output exceeds the caps (50 KiB / 2000 lines), a footer is appended:
@@ -300,13 +312,17 @@ reports each of them one final time (with `running: false`, `exit_code` /
 `signal`, and `log_path`) so exit information is never silently lost.
 
 Each entry includes **`wake_armed: boolean`** (and the text listing marks
-live armed sessions with `wake`) so the model can audit which sessions will
+live armed sessions with `[wake]`) so the model can audit which sessions will
 auto-resume on unobserved exit.
+
+The response also carries **`tool_time_utc`** (text trailer + details) so the
+model can compute a `yield_until` deadline from the trustworthy host clock
+without an extra probing call.
 
 ## Command
 
 - `/unified-exec-sessions` — human-facing escape hatch: lists live sessions in
-  a selector (armed wakes show `⏰wake`) and kills the chosen one (or all of
+  a selector (armed wakes show `[wake]`) and kills the chosen one (or all of
   them) without going through the model. Uses the same SIGTERM → 2s → SIGKILL
   escalation as `kill_session`.
 
@@ -368,7 +384,7 @@ set_on_exit session_id=2 → none
 **Running-session UI:** while any unified-exec process is still alive, the TUI
 footer shows `unified-exec: N sessions running`. After `/tree` navigation, a
 widget above the editor lists the live `session_id`s and commands (with
-`⏰wake` when auto-resume is armed) so the human sees that processes survived
+`[wake]` when auto-resume is armed) so the human sees that processes survived
 branch navigation. The footer/widget refreshes as soon as a background session
 exits; the exited session remains drainable via `write_stdin` until observed,
 preserving the usual lazy cleanup semantics.
@@ -652,7 +668,7 @@ completion and never revisit the log, it'll linger until your next reboot.
 
 - `set_on_exit`, `kill_session`, and `list_sessions` tools (codex has none of
   these). `list_sessions` exposes `wake_armed`; the running-session widget and
-  `/unified-exec-sessions` picker mark armed wakes with `⏰wake`.
+  `/unified-exec-sessions` picker mark armed wakes with `[wake]`.
 - `write_stdin` also works in pipe mode (`tty: false`), not just PTY.
   Useful for feeding lines to `jq`, `sort`, etc.
 - Streaming `onUpdate` tail window for TUI rendering during yields, plus
@@ -674,7 +690,7 @@ completion and never revisit the log, it'll linger until your next reboot.
 - No network-proxy integration.
 - No persistence across pi restarts. (Processes are terminated on
   `session_shutdown`.)
-- No PTY resize (SIGWINCH) handling.
+- No live PTY resize (SIGWINCH) handling — `cols`/`rows` are fixed at spawn.
 
 ## Windows
 

@@ -5,6 +5,13 @@
  *
  * Direct port of codex's HeadTailBuffer (codex-rs/core/src/unified_exec/head_tail_buffer.rs).
  */
+
+/** Result of `drainSegments()`: retained head/tail plus the dropped-middle count. */
+export interface DrainedSegments {
+	head: Uint8Array[];
+	tail: Uint8Array[];
+	omittedBytes: number;
+}
 export class HeadTailBuffer {
 	readonly maxBytes: number;
 	readonly headBudget: number;
@@ -111,7 +118,21 @@ export class HeadTailBuffer {
 	 * are discarded along with the retained content.
 	 */
 	drainChunks(): Uint8Array[] {
-		const out = [...this.head, ...this.tail];
+		const { head, tail } = this.drainSegments();
+		return [...head, ...tail];
+	}
+
+	/**
+	 * Drain the buffer preserving the head/tail split and the omitted-byte
+	 * count, so callers can splice an omission marker at the exact position
+	 * where middle bytes were dropped. Resets all state.
+	 */
+	drainSegments(): DrainedSegments {
+		const out: DrainedSegments = {
+			head: this.head,
+			tail: this.tail,
+			omittedBytes: this.omittedBytesInternal,
+		};
 		this.head = [];
 		this.tail = [];
 		this.headBytesInternal = 0;

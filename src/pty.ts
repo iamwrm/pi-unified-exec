@@ -47,8 +47,6 @@ export interface SpawnedChild {
 	onExit(handler: ExitCallback): void;
 	/** Send a signal to the process group; silently no-ops if already dead. */
 	kill(signal?: NodeJS.Signals): void;
-	/** Resize the PTY if applicable; no-op for pipe mode. */
-	resize(cols: number, rows: number): void;
 }
 
 // ---------------- PTY loader (best-effort) ----------------
@@ -290,14 +288,6 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 				// already gone
 			}
 		},
-		resize(cols, rows) {
-			if (exited) return;
-			try {
-				child.resize(cols, rows);
-			} catch {
-				// ignore
-			}
-		},
 	};
 }
 
@@ -403,9 +393,6 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 					// already gone
 				}
 			}
-		},
-		resize() {
-			// no-op in pipe mode
 		},
 	};
 }

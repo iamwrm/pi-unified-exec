@@ -73,7 +73,7 @@ describe("collectOutputUntilDeadline", () => {
 				deadlineMs: Date.now() + 400,
 				externalAbort: h.external,
 			});
-			assert.ok(out.length >= 15, `expected many chunks; got ${out.length}`);
+			assert.ok(out.bytes.length >= 15, `expected many chunks; got ${out.bytes.length}`);
 		} finally {
 			clearInterval(interval);
 		}
@@ -94,7 +94,7 @@ describe("collectOutputUntilDeadline", () => {
 			deadlineMs: t0 + 100,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "hello");
+		assert.equal(text(out.bytes), "hello");
 		assert.ok(dt >= 90 && dt < 250, `dt=${dt}`);
 	});
 
@@ -110,8 +110,8 @@ describe("collectOutputUntilDeadline", () => {
 			exited: h.exited,
 			deadlineMs: t0 + 200,
 		});
-		assert.ok(text(out).includes("first"));
-		assert.ok(text(out).includes("second"));
+		assert.ok(text(out.bytes).includes("first"));
+		assert.ok(text(out.bytes).includes("second"));
 	});
 
 	it("exits early when process exits AND stream closes", async () => {
@@ -130,7 +130,7 @@ describe("collectOutputUntilDeadline", () => {
 			deadlineMs: t0 + 2000,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "done");
+		assert.equal(text(out.bytes), "done");
 		assert.ok(dt < 300, `should have exited well before the 2000ms deadline; dt=${dt}`);
 	});
 
@@ -151,7 +151,7 @@ describe("collectOutputUntilDeadline", () => {
 			postExitCloseWaitMs: 100,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "trailing");
+		assert.equal(text(out.bytes), "trailing");
 		assert.ok(dt < 300, `dt=${dt}`);
 	});
 
@@ -169,7 +169,7 @@ describe("collectOutputUntilDeadline", () => {
 			postExitCloseWaitMs: 30,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "");
+		assert.equal(text(out.bytes), "");
 		assert.ok(dt < 200, `dt=${dt}`);
 	});
 
@@ -186,7 +186,7 @@ describe("collectOutputUntilDeadline", () => {
 			externalAbort: h.external,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "");
+		assert.equal(text(out.bytes), "");
 		assert.ok(dt < 200, `dt=${dt}`);
 	});
 
@@ -204,7 +204,7 @@ describe("collectOutputUntilDeadline", () => {
 			deadlineMs: t0 + 5000,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "final");
+		assert.equal(text(out.bytes), "final");
 		assert.ok(dt < 200, `dt=${dt}`);
 	});
 
@@ -219,8 +219,50 @@ describe("collectOutputUntilDeadline", () => {
 			deadlineMs: t0 + 80,
 		});
 		const dt = Date.now() - t0;
-		assert.equal(text(out), "");
+		assert.equal(text(out.bytes), "");
 		assert.ok(dt >= 70 && dt < 250, `dt=${dt}`);
+	});
+
+	it("splices an omission marker and reports omitted bytes when retention drops the middle", async () => {
+		const buffer = new HeadTailBuffer(16); // tiny cap: 8 head + 8 tail
+		const outputNotify = new Notify();
+		const outputClosed = new Gate();
+		const exitedAc = new AbortController();
+		buffer.pushChunk(s("AAAAAAAA")); // fills head
+		buffer.pushChunk(s("BBBBBBBBBBBBBBBB")); // overflows: middle dropped
+		buffer.pushChunk(s("CCCCCCCC")); // final tail
+		exitedAc.abort();
+		outputClosed.close();
+		const out = await collectOutputUntilDeadline({
+			buffer,
+			outputNotify,
+			outputClosed,
+			exited: exitedAc.signal,
+			deadlineMs: Date.now() + 1000,
+		});
+		assert.ok(out.omittedBytes > 0, `expected omitted bytes, got ${out.omittedBytes}`);
+		const body = text(out.bytes);
+		assert.ok(body.startsWith("AAAAAAAA"), `head must be intact: ${body}`);
+		assert.ok(body.endsWith("CCCCCCCC"), `tail must be intact: ${body}`);
+		assert.ok(body.includes(`[... ${out.omittedBytes} bytes omitted here`), `marker missing: ${body}`);
+		// Marker sits between head and tail, not appended at the end.
+		assert.ok(body.indexOf("bytes omitted") < body.indexOf("CCCCCCCC"));
+	});
+
+	it("reports zero omitted bytes for small output", async () => {
+		const h = makeHarness();
+		h.push("tiny");
+		h.exit();
+		h.closeStream();
+		const out = await collectOutputUntilDeadline({
+			buffer: h.buffer,
+			outputNotify: h.outputNotify,
+			outputClosed: h.outputClosed,
+			exited: h.exited,
+			deadlineMs: Date.now() + 500,
+		});
+		assert.equal(out.omittedBytes, 0);
+		assert.equal(text(out.bytes), "tiny");
 	});
 
 	it("drops empty pushes cleanly", async () => {
@@ -239,6 +281,6 @@ describe("collectOutputUntilDeadline", () => {
 			exited: h.exited,
 			deadlineMs: t0 + 2000,
 		});
-		assert.equal(text(out), "real");
+		assert.equal(text(out.bytes), "real");
 	});
 });

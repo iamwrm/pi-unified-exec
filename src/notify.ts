@@ -29,10 +29,6 @@ export class Notify {
 		for (const resolve of toWake) resolve();
 	}
 
-	/** Number of waiters currently parked (test helper). */
-	get waiterCount(): number {
-		return this.waiters.length;
-	}
 }
 
 /**

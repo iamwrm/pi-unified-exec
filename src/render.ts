@@ -90,7 +90,9 @@ function tildify(path: string): string {
 // ---------------- renderCall for exec_command ----------------
 
 export function renderExecCommandCall(
-	args: { cmd?: string; workdir?: string; tty?: boolean; yield_time_ms?: number },
+	// `on_exit` is `unknown` because the schema uses a Type.Unsafe string enum
+	// (Google-compatible), whose Static type does not survive inference.
+	args: { cmd?: string; workdir?: string; tty?: boolean; yield_time_ms?: number; on_exit?: unknown },
 	theme: Theme,
 	context: ToolRenderContext<RenderState, typeof args>,
 ): Component {
@@ -110,7 +112,10 @@ export function renderExecCommandCall(
 	if (effectiveCwd) parts.push(`cwd: ${tildify(effectiveCwd)}`);
 	if (args?.tty) parts.push("tty");
 	const suffix = parts.length ? theme.fg("muted", ` (${parts.join(" · ")})`) : "";
-	const banner = theme.fg("toolTitle", theme.bold(`$ ${cmd}`)) + suffix;
+	// [wake] is warning-colored and outside the muted group: it means "this
+	// call may interrupt the human later", the one flag worth spotting.
+	const wake = args?.on_exit === "wake" ? theme.fg("warning", " [wake]") : "";
+	const banner = theme.fg("toolTitle", theme.bold(`$ ${cmd}`)) + suffix + wake;
 
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 	text.setText(banner);
@@ -120,12 +125,14 @@ export function renderExecCommandCall(
 // ---------------- renderCall for set_on_exit ----------------
 
 export function renderSetOnExitCall(
-	args: { session_id?: number; on_exit?: string },
+	// `on_exit` is `unknown` because the schema uses a Type.Unsafe string enum
+	// (Google-compatible), whose Static type does not survive inference.
+	args: { session_id?: number; on_exit?: unknown },
 	theme: Theme,
 	context: ToolRenderContext<RenderState, typeof args>,
 ): Component {
 	const sid = args?.session_id !== undefined ? args.session_id : "?";
-	const pol = args?.on_exit ?? "?";
+	const pol = typeof args?.on_exit === "string" ? args.on_exit : "?";
 	const banner =
 		theme.fg("toolTitle", theme.bold("set_on_exit")) + theme.fg("muted", ` session_id=${sid} → ${pol}`);
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);

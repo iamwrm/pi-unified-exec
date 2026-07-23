@@ -5,7 +5,7 @@
  *   - Caps at `maxSessions` entries.
  *   - When inserting would exceed the cap, prune the LRU entry that is NOT in
  *     the N-most-recent "protected" set. Prefer already-exited entries first.
- *   - Reserved IDs (allocated but not yet inserted) block re-allocation.
+ *   - IDs are monotonic and never reused.
  *
  * The store does NOT own process lifetime beyond terminate-on-evict and
  * terminate-all-on-shutdown. The ExecSession itself drives its child.
@@ -22,7 +22,6 @@ export interface SessionStoreOptions {
 
 export class SessionStore {
 	private readonly sessions = new Map<number, ExecSession>();
-	private readonly reservedIds = new Set<number>();
 	private nextId = 1;
 	readonly maxSessions: number;
 	readonly lruProtectedCount: number;
@@ -34,16 +33,9 @@ export class SessionStore {
 		this.onEvict = opts.onEvict;
 	}
 
-	/** Allocate a new monotonic session id and reserve it. */
+	/** Allocate a new monotonic session id (never reused). */
 	allocateId(): number {
-		const id = this.nextId++;
-		this.reservedIds.add(id);
-		return id;
-	}
-
-	/** Release a reserved id that won't be used (allocation failed). */
-	releaseId(id: number): void {
-		this.reservedIds.delete(id);
+		return this.nextId++;
 	}
 
 	get(id: number): ExecSession | undefined {
@@ -68,13 +60,11 @@ export class SessionStore {
 			pruned = this.pruneLru() ?? undefined;
 		}
 		this.sessions.set(session.id, session);
-		this.reservedIds.delete(session.id);
 		return { pruned, count: this.sessions.size };
 	}
 
 	/** Remove a session (e.g., when it exits). */
 	remove(id: number): ExecSession | undefined {
-		this.reservedIds.delete(id);
 		const entry = this.sessions.get(id);
 		if (!entry) return undefined;
 		this.sessions.delete(id);
@@ -85,7 +75,6 @@ export class SessionStore {
 	terminateAll(): ExecSession[] {
 		const drained = Array.from(this.sessions.values());
 		this.sessions.clear();
-		this.reservedIds.clear();
 		for (const s of drained) {
 			try {
 				s.terminate();
@@ -107,10 +96,11 @@ export class SessionStore {
 		const entries = Array.from(this.sessions.values());
 		if (entries.length === 0) return null;
 
-		const byRecencyDesc = [...entries].sort((a, b) => b.lastUsed - a.lastUsed);
-		const protectedIds = new Set<number>(byRecencyDesc.slice(0, this.lruProtectedCount).map((e) => e.id));
-
+		// One ascending sort: the last N entries are the protected (most recent) set.
 		const byRecencyAsc = [...entries].sort((a, b) => a.lastUsed - b.lastUsed);
+		const protectedIds = new Set<number>(
+			this.lruProtectedCount > 0 ? byRecencyAsc.slice(-this.lruProtectedCount).map((e) => e.id) : [],
+		);
 
 		// Prefer oldest exited entries first.
 		const exitedCandidate = byRecencyAsc.find((e) => !protectedIds.has(e.id) && e.hasExited);
@@ -118,7 +108,6 @@ export class SessionStore {
 		if (!victim) return null;
 
 		this.sessions.delete(victim.id);
-		this.reservedIds.delete(victim.id);
 		try {
 			victim.terminate();
 		} catch {
