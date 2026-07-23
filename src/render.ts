@@ -69,11 +69,15 @@ interface DetailsShape {
 	};
 }
 
-/** Banner/footer label for an absolute wait: "2h40m later" (ISO kept in tool details). */
+/**
+ * Banner/footer label for an absolute wait: `until <ISO> · 2h40m later`.
+ * The ISO deadline is the source of truth; the "later" part is a human
+ * readable remaining-time hint. Unparseable timestamps show only `until <raw>`.
+ */
 function formatUntilLabel(yieldUntil: string, nowMs: number = Date.now()): string {
 	const targetMs = Date.parse(yieldUntil);
 	if (!Number.isFinite(targetMs)) return `until ${yieldUntil}`;
-	return formatRemainingLater(targetMs - nowMs);
+	return `until ${yieldUntil} · ${formatRemainingLater(targetMs - nowMs)}`;
 }
 
 /** Shorten `$HOME/foo/bar` → `~/foo/bar`; otherwise return as-is. */

@@ -2,6 +2,16 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-07-23 — 0.7.4
+
+### Changed
+
+- **TUI `yield_until` label now shows both the ISO deadline and the human
+  hint:** `until 2026-07-23T04:20:00Z · 49m later` instead of only the
+  countdown. The ISO timestamp is the source of truth; the "later" part is a
+  human-readable remaining-time hint. Unparseable timestamps still fall back
+  to `until <raw>` with no hint (`formatUntilLabel` in `src/render.ts`).
+
 ## 2026-07-22 — Maintenance notice
 
 - **README:** added a maintenance disclaimer — we don't have bandwidth to
