@@ -24,7 +24,7 @@
  */
 
 import { constants as osConstants } from "node:os";
-import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type AgentToolResult, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type TUnsafe } from "typebox";
 
 import type { CollectResult } from "./collect.ts";
@@ -157,6 +157,7 @@ const textDecoder = new TextDecoder("utf-8", { fatal: false });
 const textEncoder = new TextEncoder();
 
 type ResponseShape = ProcessResultDetails;
+type ProcessUpdateDetails = Partial<ProcessResultDetails> & { pid?: number; total_bytes?: number };
 type FinalizeInput = Omit<FinalizeProcessInput, "operation">;
 
 function decode(bytes: Uint8Array): string {
@@ -253,7 +254,7 @@ async function runExecCommand(
 	ctx: ExtensionCtx,
 	args: ExecCommandArgs,
 	signal: AbortSignal | undefined,
-	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	cwd: string,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
@@ -467,7 +468,7 @@ async function runWriteStdin(
 	ctx: ExtensionCtx,
 	args: WriteStdinArgs,
 	signal: AbortSignal | undefined,
-	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
@@ -643,7 +644,7 @@ async function runAbsoluteWait(
 	session: ExecSession,
 	yieldUntilRaw: string,
 	signal: AbortSignal | undefined,
-	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
@@ -872,9 +873,6 @@ function updateRunningSessionsUi(ctx: ExtensionCtx, opts: { showWidget?: boolean
 		);
 	}
 
-	// Runtime-guarded for older hosts, but typed (pi >= 0.80.5 ships setWidget).
-	if (typeof ui.setWidget !== "function") return;
-
 	if (sessions.length === 0) {
 		if (ctx.widgetVisible) {
 			ui.setWidget(SESSION_UI_KEY, undefined);
@@ -920,8 +918,8 @@ function clearSessionExitWatchers(ctx: ExtensionCtx): void {
 /** Shared streaming-update payload (relative polls and absolute waits). */
 function buildStreamUpdate(
 	session: ExecSession,
-	extra?: Record<string, unknown>,
-): { content: [{ type: "text"; text: string }]; details: unknown } {
+	extra?: Partial<ProcessResultDetails>,
+): AgentToolResult<ProcessUpdateDetails> {
 	const tailText = sanitizeOutputText(decode(session.snapshotStreamTail()));
 	return {
 		content: [{ type: "text", text: tailText }],
@@ -944,7 +942,7 @@ function buildStreamUpdate(
 
 function startStreaming(
 	session: ExecSession,
-	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	deadlineMs: number,
 	externalAbort: AbortSignal | undefined,
 ): { stop: () => void } {
@@ -1022,17 +1020,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_end", async (event) => {
 		ctx.coordinator.handleToolExecutionEnd(event.toolCallId, event.isError === true);
 	});
-	// agent_settled (pi >= 0.80.5, our peer minimum) is a safe point to flush
-	// pending completions (e.g. retry a failed send). Wrapped so an older
-	// runtime that rejects unknown events degrades gracefully — wakes still
-	// deliver via the debounce timer and tool boundaries.
-	try {
-		pi.on("agent_settled", async () => {
-			ctx.coordinator.flushPending();
-		});
-	} catch {
-		// pi < 0.80.5: no agent_settled event — non-fatal.
-	}
+	pi.on("agent_settled", async () => {
+		ctx.coordinator.flushPending();
+	});
 
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx.ui = eventCtx.ui;
@@ -1042,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
 		// Default behavior is to remove the built-in `bash` tool. Only keep it
 		// if --keep-builtin-bash was passed. Flag lookup uses the registered
 		// name without leading dashes.
-		const keep = pi.getFlag("keep-builtin-bash") ?? pi.getFlag("--keep-builtin-bash");
+		const keep = pi.getFlag("keep-builtin-bash");
 		if (keep !== true) {
 			const active = pi.getActiveTools();
 			const filtered = active.filter((name) => name !== "bash");
@@ -1197,7 +1187,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, eventCtx.cwd);
+			const shape = await runExecCommand(ctx, params, signal, onUpdate, eventCtx.cwd);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],
@@ -1249,7 +1239,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any, toolCallId);
+			const shape = await runWriteStdin(ctx, params, signal, onUpdate, toolCallId);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],

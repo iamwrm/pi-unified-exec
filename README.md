@@ -297,7 +297,7 @@ Mechanics:
   `list_sessions` reporting the exit first counts as direct observation and
   suppresses a not-yet-queued wake.
 
-Requires pi ≥ 0.80.5 (`agent_settled` extension event, used as a safe flush
+Requires pi and TUI ≥ 0.86.1 (`agent_settled` extension event, used as a safe flush
 point for pending/retried notifications).
 
 ### `kill_session`

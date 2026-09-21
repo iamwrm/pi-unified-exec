@@ -2,6 +2,14 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 0.10.0 - 2026-09-21
+
+- Remove the remaining `setWidget` capability probe; current Pi supplies this API in every mode.
+- Require Pi and TUI 0.86.1 or newer; lock development dependencies to 0.86.1.
+- Register `agent_settled` directly and read only the registered `keep-builtin-bash` flag name. Remove pre-0.80.5 and dashed-name compatibility paths.
+- Type streaming callbacks with Pi's `AgentToolUpdateCallback` and JSON-compatible process details. Remove callback casts without changing process ownership, output bounds, terminal safety or wake policy.
+- Add permanent current-event and flag-name regressions. The workflow package's opt-in offline integration also exercises this checkout's real process termination and wake suppression during SDK child shutdown.
+
 ## Unreleased
 
 ### Changed
