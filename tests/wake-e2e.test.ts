@@ -283,6 +283,81 @@ describe("write_stdin yield_until", () => {
 	});
 });
 
+describe("write_stdin bounded relative waits", () => {
+	it("retains only bounded output during a long noisy wait", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", {
+			cmd: `sleep 0.6; node -e 'let n=0; const t=setInterval(()=>{process.stdout.write("x".repeat(65536)+"\\n"); if(++n===48){clearInterval(t); console.log("noisy-done");}},10)'`,
+			yield_time_ms: 250,
+		});
+		assert.equal(typeof r1.details.session_id, "number");
+		const updates: any[] = [];
+		const r2 = await h.call("write_stdin", {
+			session_id: r1.details.session_id,
+			yield_time_ms: 3 * 2_147_483_647,
+		}, undefined, (p) => updates.push(p));
+		assert.equal(r2.details.exit_code, 0);
+		assert.equal(r2.details.wait_mode, "relative");
+		assert.equal(r2.details.wait_status, "completed");
+		assert.ok(r2.details.omitted_bytes > 1024 * 1024, "must retain head/tail, not accumulate every drained chunk");
+		assert.ok(Buffer.byteLength(r2.details.output) <= 50 * 1024);
+		assert.match(r2.details.output, /noisy-done/);
+		assert.ok(readFileSync(r2.details.log_path).length > 3 * 1024 * 1024);
+		assert.ok(updates.length <= 3, `long waits must not heartbeat: ${updates.length} updates`);
+		assert.ok(updates.every(p => Buffer.byteLength(p.details.output) <= 32 * 1024));
+	});
+
+	it("cancellation of a huge relative wait preserves buffered output and the live process", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", {
+			cmd: "sleep 0.6; echo relative-cancel-marker; sleep 30",
+			yield_time_ms: 250,
+		});
+		const ac = new AbortController();
+		const wait = h.call("write_stdin", { session_id: r1.details.session_id, yield_time_ms: Number.MAX_SAFE_INTEGER }, ac.signal);
+		try {
+			assert.ok(await waitFor(() => readFileSync(r1.details.log_path, "utf8").includes("relative-cancel-marker")));
+		} finally {
+			ac.abort();
+		}
+		const r2 = await wait;
+		assert.equal(r2.details.wait_status, "cancelled");
+		assert.equal(r2.details.wait_mode, "relative");
+		assert.equal(r2.details.running, true);
+		assert.equal(r2.details.output, "");
+		const killed = await h.call("kill_session", { session_id: r1.details.session_id });
+		assert.equal(killed.details.killed, true);
+		assert.match(killed.details.output, /relative-cancel-marker/);
+	});
+
+	it("returns running at the relative deadline without disarming wake", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250, on_exit: "wake" });
+		const r2 = await h.call("write_stdin", { session_id: r1.details.session_id });
+		assert.equal(r2.details.yield_time_ms, 5000);
+		assert.equal(r2.details.wait_status, "relative_deadline_reached");
+		assert.equal(r2.details.wait_mode, "relative");
+		assert.equal(r2.details.running, true);
+		assert.equal(r2.details.completion_notification, "armed");
+		assert.ok(r2.details.effective_wait_ms >= 4900);
+		assert.equal(h.sentMessages.length, 0);
+	});
+
+	it("rejects invalid relative durations before observing or changing a session", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
+		for (const yield_time_ms of [NaN, Infinity, -1, Number.MAX_SAFE_INTEGER + 1]) {
+			await assert.rejects(h.call("write_stdin", { session_id: r1.details.session_id, yield_time_ms }), /non-negative finite/);
+		}
+		const r2 = await h.call("kill_session", { session_id: r1.details.session_id });
+		assert.equal(r2.details.killed, true);
+	});
+});
+
 describe("exec_command on_exit", () => {
 	it("omitted or explicit 'none' preserves current behavior (no wake)", async () => {
 		const h = makeHarness();
@@ -352,7 +427,7 @@ describe("exec_command on_exit", () => {
 		await h.emit("session_start");
 		const r1 = await h.call("exec_command", { cmd: "sleep 0.5", yield_time_ms: 250, on_exit: "wake" });
 		const sid = r1.details.session_id;
-		const r2 = await h.call("write_stdin", { session_id: sid, yield_time_ms: 10_000 });
+		const r2 = await h.call("write_stdin", { session_id: sid, yield_time_ms: 900_000 });
 		assert.equal(r2.details.exit_code, 0);
 		assert.equal(r2.details.completion_delivery, "direct");
 		assert.equal(r2.details.on_exit_wake, "consumed");

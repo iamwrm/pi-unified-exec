@@ -48,7 +48,8 @@ import {
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
 import { buildShellCommand, IS_WINDOWS, resolveDefaultShell, resolveWindowsShell } from "./shell.ts";
-import { nowUtcIso, parseYieldUntil } from "./time.ts";
+import { MIN_EMPTY_YIELD_TIME_MS, nowUtcIso, parseYieldUntil, resolveEmptyPollYield } from "./time.ts";
+export { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "./time.ts";
 import {
 	finalizeKillResult,
 	finalizeProcessResult,
@@ -63,27 +64,19 @@ import { unescapeChars } from "./unescape.ts";
 
 const MIN_YIELD_TIME_MS = 250;
 const MAX_YIELD_TIME_MS = 30_000;
-const MIN_EMPTY_YIELD_TIME_MS = 5_000;
-// Diverges from codex (30 min): kept below Anthropic's 5-minute prompt-cache
-// TTL so a long empty poll never outlives the cached prompt prefix. This is a
-// HARD cache-friendly ceiling: the env override below may lower it but never
-// raise the relative cap above 290 s — longer waits must use `yield_until`.
-const DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000;
-export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
 const MAX_SESSIONS = 64;
 const WARNING_SESSIONS = 60;
 const LRU_PROTECTED_COUNT = 8;
-const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence (relative waits only)
+const OUTPUT_POLL_INTERVAL_MS = 250; // exec/input updates and short empty-poll rate limit
 // PTY dimension clamps for exec_command's cols/rows (tty: true only).
 const MIN_PTY_COLS = 20;
 const MAX_PTY_COLS = 500;
 const MIN_PTY_ROWS = 5;
 const MAX_PTY_ROWS = 300;
-// Absolute (`yield_until`) waits must not run the 250 ms heartbeat for hours;
-// output-driven TUI updates are rate-limited to this interval instead.
+// Long empty polls use output-driven updates, never a periodic heartbeat.
 const LONG_WAIT_UPDATE_INTERVAL_MS = 30_000;
 const SESSION_UI_KEY = "unified-exec.sessions";
 
@@ -105,37 +98,6 @@ function clamp(n: number, lo: number, hi: number): number {
 function clampYield(ms: number | undefined, defaultMs: number): number {
 	const v = typeof ms === "number" && ms > 0 ? ms : defaultMs;
 	return clamp(Math.floor(v), MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS);
-}
-
-export function resolveMaxEmptyPollMs(env: NodeJS.ProcessEnv = process.env): number {
-	const raw = env[MAX_EMPTY_POLL_ENV_VAR]?.trim();
-	if (!raw) return DEFAULT_MAX_BACKGROUND_POLL_MS;
-
-	const parsed = Number(raw);
-	if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_BACKGROUND_POLL_MS;
-	// The env var may LOWER the cap, but the effective cache-friendly maximum
-	// never exceeds 290 s — waits beyond that must use `yield_until`.
-	return clamp(Math.floor(parsed), MIN_EMPTY_YIELD_TIME_MS, DEFAULT_MAX_BACKGROUND_POLL_MS);
-}
-
-/**
- * Resolve the yield for an empty poll. Oversized values are REJECTED with an
- * actionable error (including the host UTC time so the model can compute a
- * `yield_until` deadline) instead of being silently clamped; undersized values
- * keep the historical clamp-up-to-minimum behavior.
- */
-function resolveEmptyPollYield(ms: number | undefined): number {
-	const cap = resolveMaxEmptyPollMs();
-	if (typeof ms === "number" && Math.floor(ms) > cap) {
-		throw new Error(
-			`write_stdin: yield_time_ms ${Math.floor(ms)} exceeds the empty-poll cap of ${cap} ms. ` +
-				`Waits longer than ${cap} ms require \`yield_until\`: omit yield_time_ms and pass an absolute ` +
-				`UTC deadline such as "2026-07-21T18:30:00Z" (compute it from the current host time below). ` +
-				`tool_time_utc: ${nowUtcIso()}`,
-		);
-	}
-	const v = typeof ms === "number" && ms > 0 ? ms : DEFAULT_WRITE_STDIN_YIELD_MS;
-	return clamp(Math.floor(v), MIN_EMPTY_YIELD_TIME_MS, cap);
 }
 
 /**
@@ -481,11 +443,10 @@ async function runWriteStdin(
 	const isEmptyPoll = writeBytes === undefined || writeBytes.length === 0;
 	const hasYieldUntil = typeof args.yield_until === "string" && args.yield_until.length > 0;
 
-	// `yield_time_ms` (relative, cache-friendly, ≤290 s) and `yield_until`
-	// (absolute UTC deadline) are never both accepted.
+	// Relative durations and absolute UTC deadlines are mutually exclusive.
 	if (hasYieldUntil && args.yield_time_ms !== undefined) {
 		throw new Error(
-			`write_stdin: pass either yield_time_ms (relative wait, max ${resolveMaxEmptyPollMs()} ms) or ` +
+			`write_stdin: pass either yield_time_ms (relative wait) or ` +
 				`yield_until (absolute UTC deadline), not both. tool_time_utc: ${nowUtcIso()}`,
 		);
 	}
@@ -497,13 +458,15 @@ async function runWriteStdin(
 				`tool_time_utc: ${nowUtcIso()}`,
 		);
 	}
-	if (hasYieldUntil) {
-		return runAbsoluteWait(ctx, session, args.yield_until!, signal, onUpdate, toolCallId);
+	if (isEmptyPoll) {
+		const parsed = hasYieldUntil ? parseYieldUntil(args.yield_until!, Date.now()) : undefined;
+		const wait: EmptyWait = parsed
+			? { mode: "absolute", durationMs: parsed.remainingMs, yieldUntil: parsed.normalized }
+			: { mode: "relative", durationMs: resolveEmptyPollYield(args.yield_time_ms) };
+		return runAttachedWait(ctx, session, wait, signal, onUpdate, toolCallId);
 	}
 
-	const yieldTimeMs = isEmptyPoll
-		? resolveEmptyPollYield(args.yield_time_ms)
-		: clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
+	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
 
 	const start = Date.now();
 	session.touch();
@@ -513,7 +476,7 @@ async function runWriteStdin(
 	ctx.coordinator.beginObservation(session.id, toolCallId);
 	try {
 		let writeFailure: string | null = null;
-		if (!isEmptyPoll && writeBytes) {
+		if (writeBytes) {
 			const ok = session.write(writeBytes);
 			if (!ok && !session.hasExited) {
 				// Still running but stdin is gone (child closed it / EPIPE earlier).
@@ -576,7 +539,7 @@ async function runWriteStdin(
 				cwd: session.cwd,
 				command: session.displayCommand,
 				yieldTimeMs,
-				extra: terminalWaitExtra(isEmptyPoll ? "relative" : undefined, armed),
+				extra: terminalWaitExtra(undefined, armed),
 			});
 		}
 		// Still running: release the lease WITHOUT marking observed — the wake
@@ -598,12 +561,6 @@ async function runWriteStdin(
 			command: session.displayCommand,
 			yieldTimeMs,
 			extra: {
-				...(isEmptyPoll
-					? {
-							wait_mode: "relative" as const,
-							wait_status: signal?.aborted ? ("cancelled" as const) : ("relative_deadline_reached" as const),
-						}
-					: {}),
 				tool_time_utc: nowUtcIso(),
 				...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
 				note: heldOpenNote(session),
@@ -630,146 +587,95 @@ function terminalWaitExtra(
 	};
 }
 
-/**
- * Absolute-deadline wait (`yield_until`): stay attached, event-driven, until
- * the process exits, the tool call is cancelled, or the UTC deadline arrives.
- *
- * Unlike relative polls this NEVER drains output while waiting (a 10-hour
- * noisy process must not accumulate unbounded history in this call); the
- * session machinery keeps its bounded head/tail buffer, rolling UI tail, and
- * complete on-disk log.
- */
-async function runAbsoluteWait(
+type EmptyWait =
+	| { mode: "relative"; durationMs: number }
+	| { mode: "absolute"; durationMs: number; yieldUntil: string };
+
+/** Both empty-poll forms retain bounded output in the session, not in the wait. */
+async function runAttachedWait(
 	ctx: ExtensionCtx,
 	session: ExecSession,
-	yieldUntilRaw: string,
+	wait: EmptyWait,
 	signal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
-	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
-		finalizeProcessResult({ ...input, operation: "write_stdin" });
-	const startMs = Date.now();
-	// Parse/validate the wall-clock instant and compute the remaining duration
-	// ONCE; the wait below runs purely on the monotonic clock.
-	const parsed = parseYieldUntil(yieldUntilRaw, startMs);
+	const startedAt = performance.now();
+	const waitFields: Partial<ResponseShape> =
+		wait.mode === "absolute"
+			? { wait_mode: wait.mode, yield_until: wait.yieldUntil }
+			: { wait_mode: wait.mode, yield_time_ms: wait.durationMs };
 	session.touch();
-
-	// Observation lease (see completion.ts): exit is held while we observe.
 	ctx.coordinator.beginObservation(session.id, toolCallId);
-
-	// No 250 ms heartbeat for hours: one initial update, heavily rate-limited
-	// output-driven updates from a NON-destructive tail snapshot, one final.
-	const streamer = onUpdate
-		? startRateLimitedStream({
-				outputNotify: session.outputNotify,
-				minIntervalMs: LONG_WAIT_UPDATE_INTERVAL_MS,
-				emit: () => onUpdate(buildStreamUpdate(session, { yield_until: parsed.normalized })),
-			})
-		: undefined;
-
-	let outcome: LongWaitOutcome;
+	let pendingTerminal = false;
+	let streamer: { stop: () => void } | undefined;
 	try {
-		outcome = await waitForExitOrDeadline({
+		if (onUpdate) {
+			streamer = startRateLimitedStream({
+				outputNotify: session.outputNotify,
+				minIntervalMs: wait.mode === "relative" && wait.durationMs <= MAX_YIELD_TIME_MS
+					? OUTPUT_POLL_INTERVAL_MS : LONG_WAIT_UPDATE_INTERVAL_MS,
+				emit: () => onUpdate(buildStreamUpdate(session, waitFields)),
+			});
+		}
+		let outcome: LongWaitOutcome = await waitForExitOrDeadline({
 			exited: session.exited,
 			externalAbort: signal,
-			durationMs: parsed.remainingMs,
+			durationMs: wait.durationMs,
 		});
-	} catch (err) {
-		ctx.coordinator.releaseObservation(session.id, toolCallId);
-		streamer?.stop();
-		throw err;
-	}
-	streamer?.stop();
-
-	// Exit wins close races: if the session is already terminal when the result
-	// is assembled, deliver the terminal result regardless of which event won.
-	if (session.hasExited) outcome = "exit";
-	const armed = ctx.coordinator.isArmed(session.id);
-
-	if (outcome === "exit") {
-		// Let trailing stdout/stderr and the log flush settle (outputClosed),
-		// then drain the bounded retained output once. externalAbort is
-		// deliberately NOT passed: exit won, and the bounded final drain must
-		// complete even if cancellation fired at the same instant.
-		const collected = await session.collect({ deadlineMs: Date.now() + 1000 });
-		removeSession(ctx, session.id);
-		ctx.coordinator.markPendingTerminal(session.id, toolCallId);
-		return finalizeResponse({
-			wallTimeSec: (Date.now() - startMs) / 1000,
+		// Exit wins close races. A cancelled live wait never drains output.
+		if (session.hasExited) outcome = "exit";
+		const collected = outcome === "cancelled"
+			? { bytes: new Uint8Array(0), omittedBytes: 0 }
+			: await session.collect({
+				deadlineMs: Date.now() + (outcome === "exit" ? 1000 : 0),
+				externalAbort: outcome === "exit" ? undefined : signal,
+			});
+		const armed = ctx.coordinator.isArmed(session.id);
+		const elapsedMs = performance.now() - startedAt;
+		const extra: Partial<ResponseShape> = { ...waitFields };
+		if (outcome === "exit") {
+			Object.assign(extra, terminalWaitExtra(wait.mode, armed));
+		} else {
+			extra.wait_status = outcome === "cancelled" ? "cancelled"
+				: wait.mode === "relative" ? "relative_deadline_reached" : "absolute_deadline_reached";
+			extra.effective_wait_ms = elapsedMs;
+			extra.tool_time_utc = nowUtcIso();
+			extra.note = heldOpenNote(session);
+			if (armed) {
+				extra.on_exit = "wake";
+				extra.completion_notification = "armed";
+			}
+		}
+		const shape = finalizeProcessResult({
+			operation: "write_stdin",
+			wallTimeSec: elapsedMs / 1000,
 			collected: collected.bytes,
 			omittedBytes: collected.omittedBytes,
 			totalBytes: session.totalBytesSeen,
-			sessionId: undefined,
-			exitCode: session.exitCode,
-			signal: session.signal,
-			failure: session.failureMessage,
+			sessionId: outcome === "exit" ? undefined : session.id,
+			exitCode: outcome === "exit" ? session.exitCode : undefined,
+			signal: outcome === "exit" ? session.signal : null,
+			failure: outcome === "exit" ? session.failureMessage : null,
 			tty: session.tty,
 			logPath: session.logPath,
 			cwd: session.cwd,
 			command: session.displayCommand,
-			extra: {
-				...terminalWaitExtra("absolute", armed),
-				yield_until: parsed.normalized,
-			},
+			extra,
 		});
+		if (outcome === "exit") {
+			removeSession(ctx, session.id);
+			ctx.coordinator.markPendingTerminal(session.id, toolCallId);
+			pendingTerminal = true;
+		} else {
+			session.touch();
+		}
+		return shape;
+	} finally {
+		streamer?.stop();
+		// Successful terminal delivery is committed by tool_execution_end.
+		if (!pendingTerminal) ctx.coordinator.releaseObservation(session.id, toolCallId);
 	}
-
-	if (outcome === "cancelled") {
-		// Do NOT drain: if pi discards the result of a cancelled call, drained
-		// output would be lost. Buffered + logged output stays with the session,
-		// and the process survives. The wake (if armed) stays eligible.
-		ctx.coordinator.releaseObservation(session.id, toolCallId);
-		return finalizeResponse({
-			wallTimeSec: (Date.now() - startMs) / 1000,
-			collected: new Uint8Array(0),
-			totalBytes: session.totalBytesSeen,
-			sessionId: session.id,
-			exitCode: undefined,
-			signal: null,
-			failure: null,
-			tty: session.tty,
-			logPath: session.logPath,
-			cwd: session.cwd,
-			command: session.displayCommand,
-			extra: {
-				wait_mode: "absolute" as const,
-				wait_status: "cancelled" as const,
-				yield_until: parsed.normalized,
-				tool_time_utc: nowUtcIso(),
-				...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
-			},
-		});
-	}
-
-	// Absolute deadline reached while still running: one bounded drain
-	// (ordinary poll semantics), release the lease, keep the wake armed.
-	const collected = await session.collect({ deadlineMs: Date.now(), externalAbort: signal });
-	session.touch();
-	ctx.coordinator.releaseObservation(session.id, toolCallId);
-	return finalizeResponse({
-		wallTimeSec: (Date.now() - startMs) / 1000,
-		collected: collected.bytes,
-		omittedBytes: collected.omittedBytes,
-		totalBytes: session.totalBytesSeen,
-		sessionId: session.id,
-		exitCode: undefined,
-		signal: null,
-		failure: null,
-		tty: session.tty,
-		logPath: session.logPath,
-		cwd: session.cwd,
-		command: session.displayCommand,
-		extra: {
-			wait_mode: "absolute" as const,
-			wait_status: "absolute_deadline_reached" as const,
-			yield_until: parsed.normalized,
-			effective_wait_ms: Date.now() - startMs,
-			tool_time_utc: nowUtcIso(),
-			...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
-			note: heldOpenNote(session),
-		},
-	});
 }
 
 /** Result of terminating a session via kill_session or the sessions command. */
@@ -1150,7 +1056,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
-			`For background progress on long non-interactive commands, start with a short yield to obtain a session_id, then use empty write_stdin polls with yield_time_ms up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly); repeat polls as needed. Do NOT use yield_until just to bypass the 290s cap — only when the human explicitly asks for a long attached wait or a wall-clock deadline (finite non-interactive jobs only).`,
+			"For a long non-interactive command, start with a short yield to obtain a session_id, then use an empty write_stdin poll with a finite yield_time_ms suited to its expected duration. There is no built-in empty-poll maximum; an operator may configure one. Keep waits short for interactive or indefinite processes. Pi manages cache warming independently.",
 			'on_exit defaults to "none". Prefer polling or human follow-up. Use on_exit: "wake" ONLY when the human explicitly wants auto-resume on unobserved completion — not for indefinite processes (dev servers, watchers). If you armed wake by mistake or the job is wrong/abandoned, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session still kills and suppresses wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
 		],
 		parameters: Type.Object({
@@ -1202,11 +1108,11 @@ export default function (pi: ExtensionAPI) {
 		name: "write_stdin",
 		label: "write_stdin",
 		description:
-			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary. For empty polls, wait with a finite yield_time_ms (relative, no built-in maximum) or yield_until (absolute UTC deadline, only when the human explicitly asks).",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
-			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped. Repeat polls as needed instead of bypassing the cap.`,
-			'Use yield_until ONLY when the human explicitly asks for a long attached wait or an explicit UTC deadline. Omit yield_time_ms and pass a future UTC timestamp ending in "Z" (compute it from tool_time_utc in tool results). Finite non-interactive sessions only. Do NOT use yield_until just to bypass the 290s cap. The call returns immediately when the process exits.',
+			"Empty write_stdin polls default to 5 seconds and accept finite yield_time_ms durations with no built-in maximum. Choose a wait based on expected job duration and needed responsiveness, not cache lifetime. Exit or cancellation returns early; cancellation leaves the process alive. Respect any configured operator limit.",
+			'Use yield_until ONLY when the human explicitly asks for a long attached wait or an explicit UTC deadline. Omit yield_time_ms and pass a future UTC timestamp ending in "Z" (compute it from tool_time_utc in tool results). Finite non-interactive sessions only. The call returns immediately when the process exits.',
 			"NEVER use yield_until for REPLs, sudo, ssh, password prompts, dev servers, file watchers, debuggers, or any indefinite/interactive session — it is only for finite commands that will exit on their own.",
 			'on_exit wake is set via exec_command or set_on_exit, not write_stdin. Observing an exit here consumes an armed wake (direct result). To disarm wake without killing, call set_on_exit(session_id, on_exit: "none").',
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
@@ -1227,7 +1133,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			yield_time_ms: Type.Optional(
 				Type.Number({
-					description: `How long (ms) this call stays attached before yielding — an attachment/progress window, not the process's lifetime or completion timeout. Default ${DEFAULT_WRITE_STDIN_YIELD_MS}; for empty input clamped to [${MIN_EMPTY_YIELD_TIME_MS}, ${resolveMaxEmptyPollMs()}]; larger empty-poll values are rejected (use yield_until only if the human explicitly asked for a long wait). Mutually exclusive with yield_until.`,
+					description: `Attachment window in ms, not a process timeout. With input: default ${DEFAULT_WRITE_STDIN_YIELD_MS}, clamped to [${MIN_YIELD_TIME_MS}, ${MAX_YIELD_TIME_MS}]. Empty polls: default/minimum ${MIN_EMPTY_YIELD_TIME_MS}, no built-in maximum; an optional PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS limit rejects larger values. Use a non-negative finite number no greater than Number.MAX_SAFE_INTEGER; fractional ms are rounded down. Mutually exclusive with yield_until.`,
 				}),
 			),
 			yield_until: Type.Optional(

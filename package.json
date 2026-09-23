@@ -1,6 +1,6 @@
 {
 	"name": "pi-unified-exec",
-	"version": "0.10.0",
+	"version": "0.11.0",
 	"description": "Codex-style unified_exec for pi: long-lived shell sessions the LLM polls and drives with write_stdin (Ctrl-C, arrow keys, PTY, REPLs, ssh, dev servers). Full output logged to disk.",
 	"keywords": [
 		"pi-package",
@@ -20,7 +20,8 @@
 	"type": "module",
 	"scripts": {
 		"check": "tsc --noEmit",
-		"test": "npm run check && tsx --test tests/*.test.ts"
+		"test": "npm run check && tsx --test tests/*.test.ts",
+		"test:tui": "node --test tests/tui-wait.test.mjs"
 	},
 	"engines": {
 		"node": ">=22.19.0"

@@ -16,6 +16,9 @@ import { IS_WINDOWS } from "../src/shell.ts";
 
 interface ToolDef {
 	name: string;
+	description: string;
+	promptGuidelines?: string[];
+	parameters: unknown;
 	execute: (
 		toolCallId: string,
 		params: any,
@@ -107,14 +110,23 @@ async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> 
 }
 
 describe("unified-exec e2e", () => {
-	it("resolveMaxEmptyPollMs reads the empty-poll cap env var (lower-only)", () => {
-		assert.equal(resolveMaxEmptyPollMs({}), 290_000);
-		// The env var may LOWER the cap but never raise the cache-friendly
-		// maximum above 290 s — longer waits must use yield_until.
-		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 290_000);
+	it("resolveMaxEmptyPollMs has no default cap and permits operator limits above 290s", () => {
+		assert.equal(resolveMaxEmptyPollMs({}), undefined);
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "300000" }), 300_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "60000" }), 60_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
-		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 290_000);
+		assert.throws(() => resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), /positive finite/);
+	});
+
+	it("describes uncapped empty waits without cache-TTL polling guidance", () => {
+		const h = makeHarness();
+		for (const name of ["exec_command", "write_stdin"]) {
+			const tool = h.tools[name];
+			const prompt = JSON.stringify([tool.description, tool.promptGuidelines, tool.parameters]);
+			assert.doesNotMatch(prompt, /290|cache-friendly/);
+			assert.match(prompt, /no built-in (?:empty-poll )?maximum/i);
+		}
+		assert.match(h.tools.write_stdin.promptGuidelines!.join("\n"), /yield_until ONLY when the human explicitly asks/);
 	});
 
 	it("registers explicit call/result renderers for every unified-exec tool", () => {
@@ -206,34 +218,28 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("empty write_stdin poll rejects yield_time_ms above 290 seconds (not clamped)", async () => {
+	it("empty write_stdin accepts a long relative wait and returns early on exit", async () => {
 		const previous = process.env[MAX_EMPTY_POLL_ENV_VAR];
 		delete process.env[MAX_EMPTY_POLL_ENV_VAR];
 		const h = makeHarness();
 		try {
 			await h.emit("session_start");
 			const r1 = await h.call("exec_command", {
-				cmd: "sleep 30",
+				cmd: "sleep 0.6; echo long-poll-finished",
 				yield_time_ms: 250,
 			});
 			assert.ok(typeof r1.details.session_id === "number", `got ${JSON.stringify(r1.details)}`);
 			const sid = r1.details.session_id;
-
-			// Oversized empty-poll waits are actionable errors: they mention
-			// yield_until and include the current host UTC time.
-			await assert.rejects(
-				() => h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 2_000_000 }),
-				(err: Error) => {
-					assert.match(err.message, /exceeds the empty-poll cap of 290000 ms/);
-					assert.match(err.message, /yield_until/);
-					assert.match(err.message, /tool_time_utc: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/);
-					return true;
-				},
-			);
-			// The session is untouched by the rejected call.
-			const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5_000 });
-			assert.equal(r2.details.session_id, sid);
-			await h.call("kill_session", { session_id: sid });
+			const start = performance.now();
+			const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 2_000_000 });
+			assert.ok(performance.now() - start < 10_000);
+			assert.equal(r2.details.yield_time_ms, 2_000_000);
+			assert.equal(r2.details.session_id, undefined);
+			assert.equal(r2.details.exit_code, 0);
+			assert.equal(r2.details.wait_mode, "relative");
+			assert.equal(r2.details.wait_status, "completed");
+			assert.equal(r2.details.yield_until, undefined);
+			assert.match(r2.details.output, /long-poll-finished/);
 		} finally {
 			if (previous === undefined) delete process.env[MAX_EMPTY_POLL_ENV_VAR];
 			else process.env[MAX_EMPTY_POLL_ENV_VAR] = previous;
@@ -241,7 +247,7 @@ describe("unified-exec e2e", () => {
 		}
 	});
 
-	it("empty write_stdin poll cap can be lowered (but not raised) with env var", async () => {
+	it("an explicit operator cap rejects longer relative waits without clamping", async () => {
 		const previous = process.env[MAX_EMPTY_POLL_ENV_VAR];
 		process.env[MAX_EMPTY_POLL_ENV_VAR] = "10000";
 		const h = makeHarness();
@@ -259,7 +265,7 @@ describe("unified-exec e2e", () => {
 			// Values above the lowered cap are rejected against that cap…
 			await assert.rejects(
 				() => h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 20_000 }),
-				/exceeds the empty-poll cap of 10000 ms/,
+				/exceeds the configured empty-poll cap of 10000 ms/,
 			);
 			// …while in-cap values behave normally.
 			const r2 = await h.call("write_stdin", {

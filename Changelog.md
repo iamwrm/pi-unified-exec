@@ -2,6 +2,15 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 0.11.0 - 2026-09-23
+
+- Remove the built-in 290-second ceiling for empty relative `write_stdin` polls. The default/minimum remains five seconds; initial exec and input-bearing calls retain their 30-second ceiling.
+- Share one bounded, event-driven, monotonic wait path between relative empty polls and absolute deadlines. Long waits retain head/tail output in the session, rather than accumulating every chunk in a tool-local array. Output-driven updates replace the periodic heartbeat for empty polls.
+- Preserve buffered output on cancelled empty polls and preserve completion observation/wake semantics. Use chunked timers for multi-day relative waits as well as absolute waits.
+- Keep `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` as an optional relative-poll limit, now permitting values above 290 seconds. Unset means no cap; invalid explicit configuration fails instead of silently disabling the limit. Tool durations must be non-negative, finite and within JavaScript's safe millisecond range.
+- Remove cache-TTL polling guidance. Pi owns best-effort warming independently; warming is neither required nor forced by this extension. Absolute deadlines and completion wakes remain human-explicit controls.
+- Validation on macOS: strict types and 301 tests pass against Pi 0.86.1, with three Windows-only skips. The six offline actual-CLI warming cases also pass on Pi 0.87.1, plus two real tmux tests for rendering, Esc survival and shutdown cleanup. Package dry-run passes; no live provider traffic or npm publication.
+
 ## 0.10.0 - 2026-09-21
 
 - Remove the remaining `setWidget` capability probe; current Pi supplies this API in every mode.

@@ -65,8 +65,8 @@ sibling view, indexed by concern:
 | Tool schemas and orchestration | `src/index.ts` (`exec_command`, `write_stdin`, `set_on_exit`, `kill_session`, `list_sessions`) |
 | Session lifecycle (spawn, write, kill, log-stream) | `src/session.ts` |
 | Session registry, LRU eviction, shutdown | `src/session-store.ts` |
-| The yield-until-deadline loop (relative polls) | `src/collect.ts` + `src/notify.ts` |
-| Absolute `yield_until` waits (event-driven, monotonic) | `src/long-wait.ts` + `src/time.ts` |
+| Short exec/input collection and final drains | `src/collect.ts` + `src/notify.ts` |
+| Relative and absolute empty polls, event-driven and monotonic | `src/long-wait.ts` + `src/time.ts`, `runAttachedWait` in `src/index.ts` |
 | Human duration / remaining labels | `src/format-time.ts` (re-exported remaining helper from `time.ts`) |
 | `on_exit: "wake"` completion scheduling (exactly-once) | `src/completion.ts` (`setOnExit`, tombstones, flush) |
 | In-memory drain buffer | `src/head-tail-buffer.ts` |
@@ -140,7 +140,15 @@ npx tsx --test tests/chars-encoding.test.ts
 # PTY-backed (requires @homebridge/node-pty-prebuilt-multiarch to have loaded)
 npx tsx --test tests/e2e-pty.test.ts
 
-# The yield-deadline loop
+# Empty-poll duration policy, shared waits and wake delivery
+npx tsx --test tests/time.test.ts tests/long-wait.test.ts tests/wake-e2e.test.ts
+
+# Actual Pi CLI with a local scripted provider; no model traffic
+npx tsx --test tests/cli-wait.test.ts
+# Optionally set PI_UNIFIED_EXEC_TEST_CLI to another published dist/cli.js.
+npm run test:tui  # isolated tmux: completion rendering, Esc survival, shutdown cleanup
+
+# Short exec/input collection
 npx tsx --test tests/collect.test.ts
 ```
 

@@ -6,7 +6,35 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { formatRemainingLater } from "../src/format-time.ts";
-import { nowUtcIso, parseYieldUntil } from "../src/time.ts";
+import { MAX_EMPTY_POLL_ENV_VAR, nowUtcIso, parseYieldUntil, resolveEmptyPollYield, resolveMaxEmptyPollMs } from "../src/time.ts";
+
+describe("empty relative poll policy", () => {
+	it("keeps a short default and minimum, without a built-in maximum", () => {
+		for (const value of [undefined, 0, 0.5, 250, 4999]) {
+			assert.equal(resolveEmptyPollYield(value, {}), 5000);
+		}
+		for (const value of [290_001, 900_000, 86_400_000, Number.MAX_SAFE_INTEGER]) {
+			assert.equal(resolveEmptyPollYield(value, {}), value);
+		}
+		assert.equal(resolveEmptyPollYield(5000.9, {}), 5000);
+	});
+
+	it("rejects invalid tool durations rather than overflowing timers", () => {
+		for (const value of [NaN, Infinity, -Infinity, -1, Number.MAX_SAFE_INTEGER + 1]) {
+			assert.throws(() => resolveEmptyPollYield(value, {}), /non-negative finite/);
+		}
+	});
+
+	it("keeps explicit operator limits and rejects invalid configuration", () => {
+		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "  " }), undefined);
+		const env = { [MAX_EMPTY_POLL_ENV_VAR]: "900000" };
+		assert.equal(resolveEmptyPollYield(900_000, env), 900_000);
+		assert.throws(() => resolveEmptyPollYield(900_001, env), /configured empty-poll cap.*Request a shorter wait.*tool_time_utc/);
+		for (const raw of ["0", "-1", "NaN", "Infinity", "oops", "9007199254740992"]) {
+			assert.throws(() => resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: raw }), /positive finite/);
+		}
+	});
+});
 
 const NOW = Date.UTC(2026, 6, 21, 8, 30, 0, 0); // 2026-07-21T08:30:00.000Z
 

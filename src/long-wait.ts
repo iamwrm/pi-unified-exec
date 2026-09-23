@@ -1,9 +1,8 @@
 /**
- * Event-driven long wait for `write_stdin`'s absolute `yield_until` mode.
+ * Event-driven wait for both relative and absolute empty `write_stdin` polls.
  *
- * Unlike collectOutputUntilDeadline (which wakes on every output chunk and
- * appends each drained chunk to a local array — fine for a 290-second poll,
- * unacceptable for a 10-hour noisy process), this wait:
+ * Unlike collectOutputUntilDeadline, this wait never accumulates drained
+ * output in a per-call array. A long noisy process retains bounded output:
  *
  *   - listens ONLY on process exit, external cancellation, and one timer;
  *   - never drains process output (the session's HeadTailBuffer keeps its
@@ -28,7 +27,7 @@ export interface LongWaitInputs {
 	exited: AbortSignal;
 	/** External cancellation (Esc / tool-call abort). Never kills the child. */
 	externalAbort?: AbortSignal;
-	/** Duration computed ONCE from the wall-clock deadline (ms). */
+	/** Validated duration in ms; absolute callers compute it once from wall time. */
 	durationMs: number;
 	/** Injectable monotonic clock (default: performance.now). Test hook. */
 	monotonicNow?: () => number;
@@ -48,14 +47,18 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 	const setTimeoutFn = inputs.setTimeoutFn ?? ((cb: () => void, ms: number) => setTimeout(cb, ms));
 	const clearTimeoutFn = inputs.clearTimeoutFn ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
 
+	if (!Number.isFinite(durationMs) || Math.abs(durationMs) > Number.MAX_SAFE_INTEGER) {
+		throw new Error("Wait duration must be finite and within the safe millisecond range.");
+	}
 	if (exited.aborted) return "exit";
 	if (externalAbort?.aborted) return "cancelled";
 	if (durationMs <= 0) return "deadline";
 
-	// Wall-clock → monotonic conversion happens exactly here: the remaining
-	// duration (already computed from Date.now() by the caller) is anchored to
-	// the monotonic clock, and the wall clock is never consulted again.
-	const monotonicDeadline = monotonicNow() + durationMs;
+	// Subtract elapsed time rather than adding a possibly enormous duration
+	// to the clock. This accepts the full safe millisecond range without an
+	// overflowing or imprecise absolute deadline. Never consult wall time.
+	const startedAt = monotonicNow();
+	const remainingMs = () => durationMs - (monotonicNow() - startedAt);
 
 	const cleanups: Array<() => void> = [];
 	try {
@@ -81,7 +84,7 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 		});
 		const armTimer = (): Promise<void> =>
 			new Promise<void>((resolve) => {
-				const remaining = Math.max(1, monotonicDeadline - monotonicNow());
+				const remaining = Math.max(1, remainingMs());
 				const armMs = Math.min(remaining, MAX_TIMER_ARM_MS);
 				timerHandle = setTimeoutFn(() => {
 					timerHandle = undefined;
@@ -93,7 +96,7 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 			const which = await Promise.race([exitP, cancelP, armTimer().then(() => "timer" as const)]);
 			if (which === "exit" || which === "cancelled") return which;
 			// Timer fired: trust only the monotonic clock.
-			if (monotonicNow() >= monotonicDeadline) return "deadline";
+			if (remainingMs() <= 0) return "deadline";
 			if (timerHandle !== undefined) {
 				clearTimeoutFn(timerHandle);
 				timerHandle = undefined;
@@ -104,7 +107,7 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 	}
 }
 
-// ---------------- Rate-limited streaming for absolute waits ----------------
+// ---------------- Rate-limited streaming for empty polls ----------------
 
 /** Minimal Notify surface (src/notify.ts) needed by the rate-limited streamer. */
 interface NotifyLike {
@@ -125,8 +128,8 @@ export interface RateLimitedStreamOptions {
 }
 
 /**
- * TUI updates for an absolute wait. The ordinary 250 ms heartbeat
- * (startStreaming in index.ts) must not run for ten hours, so this streamer:
+ * TUI updates for an empty poll. An ordinary periodic heartbeat must not
+ * run for hours, so this streamer:
  *   - emits one initial waiting update;
  *   - emits output-driven updates rate-limited to `minIntervalMs`
  *     (coalescing bursts into at most one trailing update);

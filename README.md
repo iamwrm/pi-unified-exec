@@ -33,13 +33,13 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   byte the child prints is mirrored to an on-disk log file in parallel
   with the in-memory buffer, so the full history is recoverable via
   `read(log_path)` even after the LLM-visible tail truncates.
-- **Bounded waits — the agent never stalls.** Every tool call returns
-  within a hard ceiling: 30 s for `exec_command` and interactive
-  `write_stdin`, 290 s for pure background polls (`yield_time_ms`). For a
-  human-requested long attached wait, `yield_until` stays attached until an
-  absolute UTC deadline (no default max horizon; multi-day waits re-arm
-  timers safely). A long-running process keeps running; the agent just gets
-  control back with a `session_id` and can poll again when it chooses.
+- **Independent process and attachment lifetimes.** Initial `exec_command`
+  and input-bearing `write_stdin` calls yield within 30 seconds. Empty polls
+  default to five seconds and accept finite relative durations without a
+  built-in maximum. Human-requested `yield_until` waits use an absolute UTC
+  deadline. Both return on exit, cancellation, or deadline; cancellation
+  leaves the process alive. Multi-day waits re-arm timers safely and retain
+  bounded output instead of accumulating it inside the waiting call.
 - **Completion can resume the agent (opt-in).** `exec_command(on_exit: "wake")`
   (default is `"none"`) delivers exactly one follow-up model prompt (bounded
   exit metadata, no raw output) when a backgrounded process exits while
@@ -62,17 +62,18 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
 
 ## Why
 
-Pi's built-in `bash` tool blocks until the process exits. For a dev server,
-`tail -f`, a REPL, or anything interactive, the agent either has to set a huge
-timeout and burn context waiting, or it times out and loses the process.
+Pi's built-in `bash` suits commands that run and exit. It can stream output
+and benefit from Pi's cache warmer during long calls, but cancellation kills
+the process tree. This extension provides reusable process handles, later
+input, PTYs, and observation that can end without terminating the process.
 
 Codex's alternative: every call opens a session, yields after a bounded
 `yield_time_ms` with output-so-far plus a `session_id`, and the LLM polls or
 drives the session on later turns via `write_stdin(session_id, chars, …)`. A
 PTY is available for interactive programs (Python REPL, ssh, sudo, TUIs).
 
-This extension is a faithful port of that design, with codex's constants
-preserved.
+This extension keeps that session model while letting Pi own cache warming.
+Attachment durations are not tied to a provider's cache lifetime.
 
 ## Install
 
@@ -159,20 +160,20 @@ Drives or polls an existing session.
 | `session_id` | number | — | Required. |
 | `chars` | string | `""` | Empty = pure poll; non-empty writes (after escape decoding) then polls. Mutually exclusive with `chars_b64`. |
 | `chars_b64` | string | `""` | Base64-encoded bytes to write. Binary-safe. Mutually exclusive with `chars`. |
-| `yield_time_ms` | number | `250` | Attachment/progress window (not a process timeout). Clamped [250, 30_000] with input. Empty polls clamped [5_000, 290_000]; **values above the cap are rejected** with an error that includes the current host UTC time (`tool_time_utc`). Mutually exclusive with `yield_until`. |
-| `yield_until` | string | — | Absolute UTC deadline for an **empty poll only**, strict RFC 3339 UTC (`2026-07-21T18:30:00Z` or with `.mmm`; uppercase `Z`; no offsets/local time; real calendar dates only). **Only when the human explicitly asks** for a long attached wait — not a shortcut around the 290 s cap. The call stays attached until the process exits, the call is cancelled, or the deadline arrives — whichever is first. A past deadline is an immediate poll. No default max horizon. Mutually exclusive with `yield_time_ms` and with input bytes. |
+| `yield_time_ms` | number | `250` with input; `5_000` empty | Attachment window, not a process timeout. Input-bearing calls clamp to [250, 30_000]. Empty polls have a 5_000 minimum and no built-in maximum. Supply a non-negative finite number no greater than `Number.MAX_SAFE_INTEGER`; fractional milliseconds round down. An explicit operator cap rejects larger relative polls. Mutually exclusive with `yield_until`. |
+| `yield_until` | string | — | Absolute UTC deadline for an **empty poll only**, strict RFC 3339 UTC (`2026-07-21T18:30:00Z` or with `.mmm`; uppercase `Z`; no offsets/local time; real calendar dates only). **Only when the human explicitly asks** for a long attached wait or wall-clock deadline. The call stays attached until the process exits, the call is cancelled, or the deadline arrives — whichever is first. A past deadline is an immediate poll. No default max horizon. Mutually exclusive with `yield_time_ms` and with input bytes. |
 
 #### Waiting on long-running commands — the rules
 
-1. Use `yield_time_ms` for interaction or an empty progress poll of at most
-   290 seconds (cache-friendly; stays under Anthropic's 5-minute
-   prompt-cache TTL). Repeat polls as needed.
+1. Use a finite `yield_time_ms` based on the expected job duration and how
+   soon progress needs attention. Empty polls default to five seconds and
+   have no built-in maximum. Keep waits short for interactive or indefinite
+   processes. An attachment deadline never kills the process.
 2. Use `yield_until` **only when the human explicitly asks** for a long
    attached wait or a wall-clock deadline on a **finite, non-interactive**
-   command. Do **not** use it just to bypass the 290 s cap. Omit
-   `yield_time_ms` and pass a future UTC timestamp ending in `Z` (compute
-   from `tool_time_utc`). The call still returns immediately when the
-   process exits; Esc never kills the process.
+   command. Omit `yield_time_ms` and pass a future UTC timestamp ending in
+   `Z`, computed from `tool_time_utc`. The call returns early on process
+   exit; Esc leaves the process alive.
 3. `on_exit` defaults to `"none"`. Use `"wake"` **only when the human
    explicitly wants** auto-resume on unobserved completion. If you armed
    wake by mistake or the job is abandoned, call
@@ -185,18 +186,33 @@ Drives or polls an existing session.
 dev servers, file watchers, debuggers, or any indefinite/interactive
 session — it is only for finite commands that exit on their own.
 
-During an absolute wait, the session machinery keeps working normally: the
-bounded head/tail buffer retains output, the rolling TUI tail updates (rate
-limited — no 250 ms heartbeat for hours), and every byte still lands in the
-log file. Internally the wall-clock deadline is converted once to a
-monotonic deadline, so NTP adjustments or manual clock changes cannot
-stretch or shrink an in-progress wait.
+Both empty-poll forms use the same event-driven wait. The bounded head/tail
+buffer retains output, the rolling TUI tail produces output-driven updates,
+and the log receives the raw stream. Short relative polls update at most
+four times per second; longer and absolute waits at most once per 30 seconds,
+plus initial/final updates. Quiet waits have no periodic output heartbeat.
+Absolute deadlines convert once to a duration; both forms then use monotonic
+elapsed time, so wall-clock changes cannot stretch or shrink a wait.
+
+Pi owns cache warming independently. Its default `streaming` mode can refresh
+eligible caches during attached tool waits; `idle` also permits warming after
+the agent settles. Warming is best-effort and can stop because of economics,
+missing cache metadata, safety horizons, errors, or extension vetoes. A long
+wait works even when warming is off, but the next request may miss cache.
+
+This release changes wait/output collection, not archive policy. Raw logs are
+still unbounded on disk; archive quotas and bounded log-write backlogs remain
+[follow-up work](docs/IV-0002-output-lifecycle-and-rendering.md#output-archive-safety).
 
 #### Wait/cap configuration
 
 | Env var | Default | Notes |
 |---|---|---|
-| `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | `290_000` | Cap for empty `write_stdin` polls. May be **lowered** but never raises the effective cache-friendly maximum above 290 s. Positive values below `5_000` are raised to `5_000`; invalid values use the default. |
+| `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | unset, no cap | Optional limit for empty relative `write_stdin` polls. May exceed 290 seconds. Positive values below `5_000` become `5_000`; fractions round down. Invalid, non-positive, non-finite, or unsafe values fail the relative poll instead of silently removing protection. Does not change human-explicit absolute waits. |
+
+To retain the old limit, explicitly set `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS=290000`.
+Unset or blank now means no cap. Malformed explicit values previously fell back
+to the built-in cap; they now report a configuration error.
 
 #### Control bytes and escapes in `chars`
 
@@ -444,17 +460,15 @@ MAX_SESSIONS                 = 64
 WARNING_SESSIONS             = 60
 LRU_PROTECTED_COUNT          = 8
 
-# Diverges from codex — codex allows 30 min; capped at 290 s to stay under
-# Anthropic's 5-minute prompt-cache TTL. The env override can only LOWER it;
-# longer waits use write_stdin's yield_until (absolute deadline):
-DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000  (env: PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS, lower-only)
-LONG_WAIT_UPDATE_INTERVAL_MS   = 30_000  (rate limit for absolute-wait TUI updates)
-MAX_TIMER_ARM_MS               = 2^31-1   (setTimeout chunk size for multi-day yield_until)
+# Empty relative polls have no built-in cap. Optional operator limit:
+PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS = unset
+LONG_WAIT_UPDATE_INTERVAL_MS     = 30_000  (long/absolute empty-poll update rate limit)
+MAX_TIMER_ARM_MS                 = 2^31-1  (timer chunk size for either empty-poll form)
 
 # Diverges from codex — matches pi's built-in bash instead:
 DEFAULT_MAX_BYTES            = 50 KiB  (LLM-visible per-call truncation cap)
 DEFAULT_MAX_LINES            = 2000
-OUTPUT_POLL_INTERVAL_MS      = 250     (pi-specific: onUpdate cadence)
+OUTPUT_POLL_INTERVAL_MS      = 250     (exec/input cadence; short empty-poll rate limit)
 PREVIEW_LINES                = 5       (visual TUI lines before app.tools.expand)
 ```
 
@@ -483,10 +497,10 @@ PREVIEW_LINES                = 5       (visual TUI lines before app.tools.expand
   the host on EPIPE; follow-up `write_stdin` calls report
   `failure_message: "stdin write failed: …"` when bytes can't be delivered.
 - **External abort (Esc)**: breaks the current call's wait but does not kill
-  the session. The next turn can still drive it. For `yield_until` waits the
+  the session. The next turn can still drive it. For either empty-poll form the
   cancelled call reports `wait_status: cancelled`, does not drain buffered
   output, and leaves an armed `on_exit: "wake"` eligible.
-- **Absolute wait races**: if exit, cancellation, and deadline land almost
+- **Empty-poll races**: if exit, cancellation, and deadline land almost
   simultaneously, actual process exit wins whenever the session is already
   terminal when the result is assembled.
 - **Session shutdown**: all live sessions are terminated with SIGTERM; after a
@@ -509,8 +523,8 @@ src/
 ├── session-store.ts      # SessionStore + LRU eviction (matches codex)
 ├── head-tail-buffer.ts   # direct port of codex's HeadTailBuffer
 ├── collect.ts            # collectOutputUntilDeadline
-├── long-wait.ts          # event-driven absolute (yield_until) wait + rate-limited streaming
-├── time.ts               # strict RFC 3339 UTC parsing for yield_until
+├── long-wait.ts          # shared event-driven empty-poll wait + rate-limited streaming
+├── time.ts               # relative duration/operator limit + strict UTC deadline parsing
 ├── format-time.ts        # shared elapsed / remaining human labels
 ├── completion.ts         # CompletionCoordinator: on_exit "wake" scheduling (exactly-once)
 ├── notify.ts             # Notify / Gate / sleep primitives
@@ -587,8 +601,10 @@ set_on_exit session_id=2 on_exit=none → disarmed …; wake not armed
 # live armed sessions include wake_armed: true / "wake" in the text listing
 ```
 
-Prefer repeated `yield_time_ms` ≤ 290 s polls for ordinary progress. Use
-`yield_until` only when the human explicitly wants a long attached wait. If
+For ordinary progress, choose a finite relative wait such as
+`write_stdin(session_id=2, yield_time_ms=900000)`. It returns early on exit;
+there is no need to split it into 290-second polls. Use `yield_until` only
+when the human explicitly wants a long attached wait or wall-clock deadline. If
 the deadline arrives (or the wait is cancelled) while the process is still
 running and wake is still armed, one follow-up prompt is delivered when the
 process exits — unless you `set_on_exit … none` first.
@@ -635,8 +651,13 @@ From the repo root:
 
 ```bash
 npm install
-npm test                 # strict typecheck + all tests
+npm test                 # strict typecheck + unit/integration + offline actual-CLI tests
+npm run test:tui         # isolated tmux acceptance, skips if tmux is unavailable
 ```
+
+The CLI/TUI fixtures use a local scripted provider, not a live model. Set
+`PI_UNIFIED_EXEC_TEST_CLI=/path/to/pi/dist/cli.js` to exercise another published
+Pi version without changing package dependency pins.
 
 Tests cover yield_until timestamp validation (strict RFC 3339 UTC subset,
 impossible-date rejection, far-future acceptance, `tool_time_utc` on errors),

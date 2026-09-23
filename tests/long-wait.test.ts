@@ -86,6 +86,38 @@ describe("waitForExitOrDeadline", () => {
 		);
 	});
 
+	it("accepts the largest safe duration without timer overflow and remains cancellable", async () => {
+		const exited = new AbortController();
+		const external = new AbortController();
+		const arms: number[] = [];
+		let cleared = 0;
+		const outcome = await waitForExitOrDeadline({
+			exited: exited.signal,
+			externalAbort: external.signal,
+			durationMs: Number.MAX_SAFE_INTEGER,
+			monotonicNow: () => 12345.6,
+			setTimeoutFn: (_cb, ms) => {
+				arms.push(ms);
+				queueMicrotask(() => external.abort());
+				return 1;
+			},
+			clearTimeoutFn: () => { cleared++; },
+		});
+		assert.equal(outcome, "cancelled");
+		assert.deepEqual(arms, [MAX_TIMER_ARM_MS]);
+		assert.equal(cleared, 1);
+	});
+
+	it("rejects invalid durations before arming timers", async () => {
+		for (const durationMs of [NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+			await assert.rejects(waitForExitOrDeadline({
+				exited: new AbortController().signal,
+				durationMs,
+				setTimeoutFn: () => { throw new Error("timer should not arm"); },
+			}), /safe millisecond range/);
+		}
+	});
+
 	it("runs on the monotonic clock: an early timer fire re-arms instead of ending the wait", async () => {
 		// Simulate coarse/foul timers: the injected setTimeout always fires
 		// almost immediately, but the injected monotonic clock only advances a
