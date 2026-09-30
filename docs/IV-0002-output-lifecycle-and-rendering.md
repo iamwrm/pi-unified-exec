@@ -25,6 +25,12 @@ The initiative establishes a durable three-layer output contract:
    a recovery path.
 3. **TUI:** the bounded result is collapsed to five visual lines by default and
    expands through Pi's configured `app.tools.expand` binding.
+4. **Scripts (0.12.0):** Pi codemode scripts receive `structuredContent`
+   matching each tool's `outputSchema`, whose `output` is the same bounded,
+   terminal-inert tail with real newlines. Without it, scripts received the
+   whole text envelope as one string. Printing that string inside an object
+   collapsed it to one escaped logical line, which Pi's logical-line codemode
+   preview could not bound.
 
 ## Requirements
 
@@ -60,6 +66,8 @@ The initiative establishes a durable three-layer output contract:
 | Tool-specific render entry points over generic fallback | Kill/list semantics differ from process yields; explicit renderers prevent identity from being mistaken for liveness. |
 | Expand only bounded output | Rendering or reading an unlimited multi-gigabyte log from a synchronous tool row is unsafe. |
 | Make result text terminal-inert; preserve raw logs | PTY output can contain clipboard, alternate-screen, keyboard-mode, and cursor controls. Models need text, not executable terminal state; forensic bytes remain recoverable by path. |
+| Project script results from details, not a second serializer | `structuredContent` inherits the bounds and terminal safety of `details.output`; metadata strings reuse `safeMeta`. Model `content` stays byte-identical. |
+| Require Pi 0.99.1 for 0.12.0 | `outputSchema`/`structuredContent` do not exist in earlier Pi types. Older Pi users stay on 0.11.x. |
 | Keep complete logs for now | Archive bounding/retention is a separate policy change and remains follow-up work. |
 
 ## Implementation map
@@ -68,6 +76,7 @@ The initiative establishes a durable three-layer output contract:
 |---|---|
 | Terminal-control scanner | `src/output-safety.ts` |
 | Shared output envelope, truncation, process/kill text | `src/tool-result.ts` |
+| Codemode script schemas and projections | `src/script-result.ts`, `tests/script-result.test.ts` |
 | Kill collection, partial sanitization, and tool registration | `src/index.ts` (`TerminateOutcome`, `buildStreamUpdate`, `kill_session`) |
 | Explicit renderers and shared five-line preview | `src/render.ts` |
 | Pure output and terminal-safety tests | `tests/{tool-result,output-safety}.test.ts` |
@@ -138,6 +147,7 @@ app.tools.expand again: five-line tail restored
 - Humans reviewing streaming and settled tool rows in Pi's TUI; exact PTY logs
   must be opened through a non-executing reader/escape visualizer, not `cat`.
 - Persisted Pi session entries containing tool result details.
+- Pi codemode scripts calling these tools through `ctx.executeTool()`.
 - Private path-based adoption in `piagent-config`, whose lifecycle owner links
   this public initiative.
 

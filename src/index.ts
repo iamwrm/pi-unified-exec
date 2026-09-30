@@ -45,6 +45,17 @@ import {
 	renderSetOnExitResult,
 	renderWriteStdinCall,
 } from "./render.ts";
+import {
+	killNotFoundScriptResult,
+	killScriptResult,
+	killScriptResultSchema,
+	listSessionsScriptResult,
+	listSessionsScriptResultSchema,
+	processScriptResult,
+	processScriptResultSchema,
+	setOnExitScriptResult,
+	setOnExitScriptResultSchema,
+} from "./script-result.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
 import { buildShellCommand, IS_WINDOWS, resolveDefaultShell, resolveWindowsShell } from "./shell.ts";
@@ -1058,7 +1069,9 @@ export default function (pi: ExtensionAPI) {
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
 			"For a long non-interactive command, start with a short yield to obtain a session_id, then use an empty write_stdin poll with a finite yield_time_ms suited to its expected duration. There is no built-in empty-poll maximum; an operator may configure one. Keep waits short for interactive or indefinite processes. Pi manages cache warming independently.",
 			'on_exit defaults to "none". Prefer polling or human follow-up. Use on_exit: "wake" ONLY when the human explicitly wants auto-resume on unobserved completion — not for indefinite processes (dev servers, watchers). If you armed wake by mistake or the job is wrong/abandoned, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session still kills and suppresses wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
+			"In codemode scripts, exec_command and write_stdin resolve to objects: print r.output with text(r.output) and check r.exit_code / r.session_id, instead of printing the whole result object.",
 		],
+		outputSchema: processScriptResultSchema,
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
 			workdir: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
@@ -1098,6 +1111,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],
 				details: shape,
+				structuredContent: processScriptResult(shape),
 			};
 		},
 		renderCall: renderExecCommandCall,
@@ -1118,6 +1132,7 @@ export default function (pi: ExtensionAPI) {
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
+		outputSchema: processScriptResultSchema,
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session id from exec_command." }),
 			chars: Type.Optional(
@@ -1150,6 +1165,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],
 				details: shape,
+				structuredContent: processScriptResult(shape),
 			};
 		},
 		renderCall: renderWriteStdinCall,
@@ -1168,6 +1184,7 @@ export default function (pi: ExtensionAPI) {
 			"Prefer arming wake only when the human explicitly asked for auto-resume.",
 			"Disarm cannot recall a completion follow-up that was already delivered to pi.",
 		],
+		outputSchema: setOnExitScriptResultSchema,
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session id from exec_command." }),
 			on_exit: StringEnum(
@@ -1183,6 +1200,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `No such session: ${sid}` }],
 					details: { session_id: sid, found: false },
+					structuredContent: setOnExitScriptResult({ session_id: sid, found: false }),
 				};
 			}
 			const status = ctx.coordinator.setOnExit(sid, policy, session);
@@ -1191,6 +1209,7 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: `No such session: ${sid}` }],
 					details: { session_id: sid, found: false },
+					structuredContent: setOnExitScriptResult({ session_id: sid, found: false }),
 				};
 			}
 			const running = session ? !session.hasExited : false;
@@ -1201,6 +1220,14 @@ export default function (pi: ExtensionAPI) {
 				(armed ? "; wake armed" : "; wake not armed");
 			return {
 				content: [{ type: "text", text }],
+				structuredContent: setOnExitScriptResult({
+					session_id: sid,
+					found: true,
+					on_exit: policy,
+					status,
+					running,
+					wake_armed: armed,
+				}),
 				details: {
 					session_id: sid,
 					found: true,
@@ -1224,6 +1251,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after. Also suppresses any armed on_exit wake.",
 		promptSnippet: "Terminate a session",
+		outputSchema: killScriptResultSchema,
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session to terminate." }),
 			signal: Type.Optional(
@@ -1246,6 +1274,7 @@ export default function (pi: ExtensionAPI) {
 						session_id: sid,
 						found: false,
 					} as const,
+					structuredContent: killNotFoundScriptResult(sid),
 				};
 			}
 			const { session, escalated, collected, killed } = outcome;
@@ -1280,6 +1309,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: renderKillResultText(details) }],
 				details,
+				structuredContent: killScriptResult(details),
 			};
 		},
 		renderCall: renderKillSessionCall,
@@ -1291,6 +1321,7 @@ export default function (pi: ExtensionAPI) {
 		label: "list_sessions",
 		description: "List all live unified-exec sessions in this pi run.",
 		promptSnippet: "List live sessions",
+		outputSchema: listSessionsScriptResultSchema,
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
@@ -1351,6 +1382,12 @@ export default function (pi: ExtensionAPI) {
 				// trustworthy host clock without an extra probing call.
 				content: [{ type: "text", text: `${header}\n${lines.join("\n")}\ntool_time_utc: ${toolTimeUtc}` }],
 				details: { sessions, active_count: live.length, just_exited_count: reaped.length, tool_time_utc: toolTimeUtc },
+				structuredContent: listSessionsScriptResult({
+					sessions,
+					active_count: live.length,
+					just_exited_count: reaped.length,
+					tool_time_utc: toolTimeUtc,
+				}),
 			};
 		},
 		renderCall: renderListSessionsCall,

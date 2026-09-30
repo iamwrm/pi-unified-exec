@@ -313,8 +313,9 @@ Mechanics:
   `list_sessions` reporting the exit first counts as direct observation and
   suppresses a not-yet-queued wake.
 
-Requires pi and TUI ≥ 0.86.1 (`agent_settled` extension event, used as a safe flush
-point for pending/retried notifications).
+Requires pi and TUI ≥ 0.99.1 (`agent_settled` extension event, used as a safe flush
+point for pending/retried notifications; `outputSchema` / `structuredContent` for
+codemode scripts).
 
 ### `kill_session`
 
@@ -367,6 +368,29 @@ active set at session start so the LLM is steered toward `exec_command` /
 - `--keep-builtin-bash` — preserve the built-in `bash` alongside the
   unified-exec tools. Useful if you've got skills or prompts that explicitly
   expect `bash(cmd, timeout)`.
+
+## Codemode scripts
+
+Every tool declares an `outputSchema` and returns a matching
+`structuredContent`, so Pi codemode scripts receive an object instead of the
+text envelope the model sees:
+
+```js
+const r = await tools.exec_command({ cmd: "npm test", yield_time_ms: 30000 });
+if (r.running) text(`still running as session ${r.session_id}`);
+else text(`exit ${r.exit_code}`);
+text(r.output); // real newlines, so codemode's collapsed preview stays bounded
+```
+
+`exec_command` and `write_stdin` resolve to `{ status, running, output,
+truncated, session_id?, exit_code?, signal?, failure_message?, log_path?,
+wall_time_seconds, note?, wait_status?, on_exit?, tool_time_utc? }`;
+`kill_session`, `set_on_exit`, and `list_sessions` have matching typed shapes
+(`src/script-result.ts`). `output` is the same bounded, terminal-inert tail as
+`details.output`. Print `r.output` rather than the whole object: `text(r)`
+serializes newlines as `\n` and turns the output into one long line.
+
+Model-visible `content` and persisted `details` are unchanged.
 
 ## TUI rendering
 
@@ -686,7 +710,9 @@ construction, PATH lookup with synthetic PATH fixtures, Windows
 bash→powershell fallback both branches, WSL-stub exclusion, binary
 resolution caching), PTY loader guard (EXPECT_PTY assertion so a prebuild
 load failure is a red build, ConPTY disposal mock), and cmd.exe quoting
-e2e (operators, embedded quotes, %VAR%, parentheses, pipes).
+e2e (operators, embedded quotes, %VAR%, parentheses, pipes), and codemode
+script results (`outputSchema`/`structuredContent` for all five tools plus an
+offline actual-Pi codemode run through Pi's collapsed renderer).
 
 CI runs the suite on ubuntu, macos, and windows runners.
 

@@ -120,7 +120,7 @@ function decode(bytes: Uint8Array): string {
 	return textDecoder.decode(bytes);
 }
 
-function safeMeta(value: string, max = 4096): string {
+export function safeMeta(value: string, max = 4096): string {
 	// Metadata sits outside the 50 KiB child-output body. Bound both the scan and
 	// rendered value so a malformed path/error cannot recreate an oversized
 	// result through a header field.

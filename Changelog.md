@@ -2,6 +2,14 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 0.12.0 - 2026-09-29
+
+- Give codemode scripts structured results. All five tools declare an `outputSchema` and return `structuredContent` (`src/script-result.ts`). Scripts receive `output` as a real multi-line string plus typed `exit_code`, `session_id`, `running`, `truncated` and `log_path`, instead of the whole text envelope. Previously, printing that string inside an object serialized its newlines, producing one logical line that Pi's five-line codemode preview could not bound (22 rows for 40 short lines at width 80).
+- `structuredContent` derives only from the bounded, sanitized result details. Metadata strings are bounded and single-line. Model-visible `content`, persisted `details` and TUI rendering are unchanged.
+- Add a prompt guideline: in codemode, print `r.output` rather than the whole result object.
+- Require Pi and TUI 0.99.1 or newer (`outputSchema`/`structuredContent`); lock development dependencies to Pi/TUI 0.99.1 and TypeBox 1.3.27, matching Pi's resolved TypeBox.
+- Add `tests/script-result.test.ts`: schema checks for exited, running, non-zero, signalled, truncated, control-sequence, killed, failed-kill and unknown-session results; checks on all five registered tools; and an offline actual Pi 0.99.1 codemode run that asserts the script receives an object with 40 real output lines and that Pi's collapsed codemode renderer stays within eight rows.
+
 ## 0.11.0 - 2026-09-23
 
 - Remove the built-in 290-second ceiling for empty relative `write_stdin` polls. The default/minimum remains five seconds; initial exec and input-bearing calls retain their 30-second ceiling.
