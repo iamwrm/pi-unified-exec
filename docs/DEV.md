@@ -77,6 +77,7 @@ sibling view, indexed by concern:
 | PTY vs pipe spawning, Windows tree-kill | `src/pty.ts` |
 | Shell selection & argv construction | `src/shell.ts` |
 | Explicit call/result renderers for all five tools | `src/render.ts` |
+| Default-on native codemode preview wrapper | `src/codemode-render.ts` |
 | Initiative / doctrine docs | `docs/IV-*.md`, `docs/DC-*.md` |
 | Constants mirroring codex | top of `src/index.ts` |
 
@@ -146,10 +147,13 @@ npx tsx --test tests/time.test.ts tests/long-wait.test.ts tests/wake-e2e.test.ts
 # Actual Pi CLI with a local scripted provider; no model traffic
 npx tsx --test tests/cli-wait.test.ts
 # Optionally set PI_UNIFIED_EXEC_TEST_CLI to another published dist/cli.js.
-npm run test:tui  # isolated tmux: completion rendering, Esc survival, shutdown cleanup
+npm run test:tui  # isolated tmux: waits/Esc plus codemode A/B/C, widths/themes/expansion
 
 # Short exec/input collection
 npx tsx --test tests/collect.test.ts
+
+# Native codemode display-only factory, renderer, opt-out and actual-CLI parity
+npx tsx --test tests/codemode-render.test.ts tests/codemode-cli.test.ts
 ```
 
 ## Writing new tests
@@ -219,10 +223,18 @@ as defense for legacy results and fallback content.
 
 ### Tune TUI rendering
 
-`src/render.ts` is the only file that touches pi-tui (`Text`, `Container`,
-`theme.fg`, etc.). Add or update `tests/render.test.ts` for collapse, expand,
-re-collapse, width, status, and hint behavior, then use the tmux recipe above
-for a real interactive smoke test.
+`src/render.ts` owns the process-tool renderers. `src/codemode-render.ts` wraps
+Pi's native codemode result renderer, default-on, without changing its executor,
+schema identity, loadout or persistence. Add or update the corresponding
+`tests/{render,codemode-render,codemode-cli}.test.ts`; run `npm run test:tui`
+for actual CLI rendering. `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out of the
+codemode replacement; re-enable the built-in when opting out.
+
+Never pass the collapsed wrapper as native `context.lastComponent`: Pi's
+renderer expects its `Text` and calls `.setText()`. Unwrap the cached `inner`
+component before delegation, preserve invalidation and return native expanded
+output. Keep spill-path recovery and configured expansion hints visible within
+the row cap; do not claim a hidden-row count after native logical-line clipping.
 
 ## Debugging aids
 
@@ -278,9 +290,10 @@ For each release entry, focus on three kinds of items:
   but worth knowing when we later want to adopt them (new hook
   arguments, new `ctx.ui` primitives, etc.).
 
-Ignore everything about the TUI chrome, OAuth providers, RPC protocol,
-`models.json`, custom themes, `/slash` commands, skills, subagents,
-compaction, hooks, and HTML export — we don't use any of them.
+Prioritize changes touching our actual import/lifecycle surface. Codemode now
+uses the public native factory and its renderer cache, loadout/settings, MCP
+schema-identity recognition and branch-local store. Review those release notes
+and sources even when the change is described as TUI or MCP behavior.
 
 ### 2. Cross-check against our import surface
 
@@ -301,6 +314,15 @@ As of 2026-08-04 the surface is:
   `setActiveTools`
 - **`ExtensionContext` fields** (via the `ctx` / `eventCtx` argument):
   `ui.notify`, `cwd`, `hasUI`
+
+The 0.12.1 codemode wrapper additionally consumes `createCodemodeExtension`,
+`CodemodeToolDetails`, `ToolDefinition`, `Component`, `truncateToWidth`, and
+the native factory's API forwarding (`getSettings`, `getAllTools`,
+`appendEntry`). On each Pi upgrade verify `builtin:codemode` replacement and
+exclusion, exact parameter-schema identity, inactive default, mode/budget
+loadout, nested/model helpers, store persistence and cached renderer shape.
+Run both codemode test files and actual tmux expansion/collapse; a silent
+generic fallback is a failure, not acceptable compatibility.
 
 If an upstream changelog entry mentions **none** of the symbols above,
 it cannot affect us. If it mentions one, read it carefully and run

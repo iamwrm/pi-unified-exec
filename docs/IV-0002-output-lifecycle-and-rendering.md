@@ -1,8 +1,8 @@
 # IV-0002 — Bounded output lifecycle and compact tool rendering
 
-**Status:** shipped in source (0.9.0)
+**Status:** active; codemode visual-row fix shipped in 0.12.1
 **Root IV:** this document
-**Related release:** [Changelog.md](../Changelog.md) — 2026-08-04 — 0.9.0
+**Related release:** [Changelog.md](../Changelog.md) — 2026-09-30 — 0.12.1
 **Workspace doctrine:** [docs/DC-0001-agentic-workspace.md](./DC-0001-agentic-workspace.md)
 
 ## Intent
@@ -17,7 +17,7 @@ model-output cap and persisted an undocumented unbounded `final_output` field.
 but the inconsistency meant the package's claim that tool output was compact and
 expandable was not true for every tool.
 
-The initiative establishes a durable three-layer output contract:
+The initiative establishes a durable output contract across these layers:
 
 1. **Capture:** the child stream is mirrored to its session log.
 2. **Model/session result:** every output-bearing result is a bounded,
@@ -31,6 +31,12 @@ The initiative establishes a durable three-layer output contract:
    whole text envelope as one string. Printing that string inside an object
    collapsed it to one escaped logical line, which Pi's logical-line codemode
    preview could not bound.
+5. **Codemode presentation (0.12.1):** by default register Pi's native codemode
+   definition with a result-renderer-only decorator. Compact JSON from
+   `text(r)` / settled results is one logical line and can still flood native
+   previews. Bound actual rendered rows at ten, including call summaries,
+   spacers, clipping hint and native full-output-path footer; leave expanded
+   output and all model/script data native.
 
 ## Requirements
 
@@ -55,6 +61,13 @@ The initiative establishes a durable three-layer output contract:
 - Keep truncation and log-recovery warnings visible while collapsed.
 - Do not synchronously load an arbitrary log file when expanded. Expanded mode
   shows the complete bounded result; `log_path` owns complete-stream recovery.
+- Preserve native codemode definition fields/schema by reference, inactive
+  default, settings/loadout, MCP auto-activation, model helpers and store/load.
+- Unwrap cached native components before calling the original renderer; Pi
+  catches renderer exceptions and can silently expose the unbounded fallback.
+- Default-on codemode replacement must not write settings or activate the tool.
+  Offer only explicit opt-out `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0`; document
+  duplicate built-in exclusion and re-enabling it when opting out.
 
 ## Decisions
 
@@ -69,6 +82,10 @@ The initiative establishes a durable three-layer output contract:
 | Project script results from details, not a second serializer | `structuredContent` inherits the bounds and terminal safety of `details.output`; metadata strings reuse `safeMeta`. Model `content` stays byte-identical. |
 | Require Pi 0.99.1 for 0.12.0 | `outputSchema`/`structuredContent` do not exist in earlier Pi types. Older Pi users stay on 0.11.x. |
 | Keep complete logs for now | Archive bounding/retention is a separate policy change and remains follow-up work. |
+| Bundle the native codemode display fix by default in 0.12.1 | Owner requested the fix here, not a separate package. It applies globally to nested tools while unified-exec is loaded; no Pi core patch or executor fork. |
+| Wrap the public factory via a receiver-bound API proxy | Keep native execution/schema/loadout/persistence and method receivers intact; intercept only tool registration and result rendering. |
+| Keep native ordering and clip the rendered head at ten rows | Bound the whole result text component. Call summaries can consume the budget; reserve recovery/hint footer space. Script-call and separate image components are outside this cap. |
+| Use a non-numeric clipping hint | Native rendering has already hidden logical lines, so its rendered row count is not the full-output hidden-row count. |
 
 ## Implementation map
 
@@ -79,6 +96,9 @@ The initiative establishes a durable three-layer output contract:
 | Codemode script schemas and projections | `src/script-result.ts`, `tests/script-result.test.ts` |
 | Kill collection, partial sanitization, and tool registration | `src/index.ts` (`TerminateOutcome`, `buildStreamUpdate`, `kill_session`) |
 | Explicit renderers and shared five-line preview | `src/render.ts` |
+| Native codemode factory/renderer wrapper | `src/codemode-render.ts`; registration from `src/index.ts` |
+| Codemode width/cache/schema and real-CLI parity | `tests/codemode-render.test.ts`, `tests/codemode-cli.test.ts` |
+| Real codemode TUI A/B/C, opt-out, warning and recovery | `tests/tui-codemode.test.mjs`, `tests/fixtures/codemode-*` |
 | Pure output and terminal-safety tests | `tests/{tool-result,output-safety}.test.ts` |
 | Collapse/expand/list/legacy-safety renderer tests | `tests/render.test.ts` |
 | Real delayed noisy-kill regression | `tests/e2e.test.ts` |
@@ -113,6 +133,30 @@ Automated gate:
 ```bash
 npm test
 ```
+
+Codemode focused gates (all providers are offline fixtures; MCP is local stdio):
+
+```bash
+npx tsx --test tests/codemode-render.test.ts tests/codemode-cli.test.ts
+npm run test:tui
+```
+
+At 100×60, native object/settled result text components took 20/21 rows;
+the wrapper takes at most ten including summaries/spacers/footer. Multiline
+output keeps the original 36-more-lines hint when it fits. Actual CLI gates
+compare content after normalizing only the elapsed-time header, plus native
+declarations, mode/budget, default/opt-out/MCP activation, search/model helpers
+and all store entries. TUI gates exercise Ctrl+O expansion and recollapse at
+40/80/100 columns, regular/fullscreen and dark/system/light themes, with no
+generic renderer fallback. Re-run on Pi upgrades; local TUI evidence is Linux,
+not live provider traffic or non-Linux terminal qualification.
+
+Local 0.12.1 release gate: `EXPECT_PTY=1 npm test` passes strict types and
+342 tests, with three Windows-only skips. `npm run test:tui` passes all 21
+cases. The eight codemode CLI cases and all TUI cases also pass with
+`PI_UNIFIED_EXEC_TEST_CLI` pointing at the installed 0.99.1 bundled CLI.
+`npm audit --omit=dev` reports zero vulnerabilities and `npm pack --dry-run`
+includes the new renderer module. No live provider traffic was used.
 
 The focused process regression:
 

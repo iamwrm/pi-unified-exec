@@ -4,6 +4,11 @@ Whenever you edit code, docs, tests, or package metadata, update `Changelog.md` 
 
 Before changing long-wait/wake behavior, read `docs/IV-0001-long-wait-and-wake-control.md`. Before changing result bounds, logs, truncation, or TUI tool rendering, read `docs/IV-0002-output-lifecycle-and-rendering.md`.
 
+On Pi upgrades, also requalify `src/codemode-render.ts`: public native factory,
+schema identity/MCP activation, default inactivity, mode/budget/loadout,
+store/model helpers, and cached `lastComponent` unwrapping. Run the codemode
+unit/CLI tests and `npm run test:tui`; renderer fallback must not mask failures.
+
 Canonical verification:
 
 ```bash

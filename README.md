@@ -54,6 +54,10 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   with Pi's configured `app.tools.expand` binding. Model/result/TUI text strips
   terminal-control sequences; the complete raw stream remains available at
   `log_path`.
+- **Default-on compact codemode previews.** A display-only wrapper bounds
+  collapsed codemode results to ten visual rows, including object/settled
+  output from any nested tool. Native execution and expansion are unchanged;
+  `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out for other codemode replacements.
 - **Ctrl-C and other control bytes, not just stdin text.**
   `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
   `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
@@ -379,7 +383,7 @@ text envelope the model sees:
 const r = await tools.exec_command({ cmd: "npm test", yield_time_ms: 30000 });
 if (r.running) text(`still running as session ${r.session_id}`);
 else text(`exit ${r.exit_code}`);
-text(r.output); // real newlines, so codemode's collapsed preview stays bounded
+text(r.output); // readable multiline output rather than the whole JSON object
 ```
 
 `exec_command` and `write_stdin` resolve to `{ status, running, output,
@@ -391,6 +395,47 @@ wall_time_seconds, note?, wait_status?, on_exit?, tool_time_utc? }`;
 serializes newlines as `\n` and turns the output into one long line.
 
 Model-visible `content` and persisted `details` are unchanged.
+
+### Default-on codemode display fix (0.12.1)
+
+Pi 0.99.1's collapsed codemode preview counts logical lines before wrapping.
+`text(r)` or `text({ i, ...settled })` creates one long JSON line, which can
+wrap across the screen even though the result is collapsed. This package now
+uses Pi's public codemode factory and changes **only its result renderer**:
+after native wrapping, the collapsed result text component is capped at ten
+visual rows, including nested-call summaries, spacers and footer. Small native
+previews and expanded output stay unchanged. A configured expansion hint and
+`Full output:` recovery footer remain visible when clipping; long footer paths
+are width-truncated, with the complete path retained on expansion.
+
+This applies to **all codemode nested tools**, not only unified-exec. It does
+not activate codemode, rewrite script/model results, change process output
+bounds, patch Pi, or write your settings. The script-call renderer and separate
+inline image components are outside this result-text cap.
+
+**One-time setup to silence the duplicate built-in warning:** disable
+`codemode` under Built-in in `pi config`, or add this exclusion to your settings
+without dropping existing entries:
+
+```json
+{ "extensions": ["-builtin:codemode"] }
+```
+
+The replacement still honors `defaultTools: ["+codemode"]`, CLI tool selection,
+`codemode.mode`, `codemode.inlineBudget`, native MCP activation and branch-local
+store/load. Leaving both extensions enabled produces Pi's replacement warning;
+only the replacement is retained. `/reload` or restart after configuration
+changes.
+
+**Explicit opt-out**, for a different codemode replacement or native display:
+
+```bash
+PI_UNIFIED_EXEC_COMPACT_CODEMODE=0 pi
+```
+
+When opting out, re-enable `builtin:codemode` (remove the exclusion above) unless
+another extension supplies codemode. The display fix is on by default; no flag
+or setting is needed to opt in.
 
 ## TUI rendering
 
@@ -557,6 +602,7 @@ src/
 ├── output-safety.ts      # terminal-control stripping (raw bytes stay in logs)
 ├── tool-result.ts        # bounded process/kill envelopes + model-visible text
 ├── render.ts             # explicit renderCall / renderResult for all five tools
+├── codemode-render.ts    # default-on native codemode visual-row preview wrapper
 └── unescape.ts           # C-style escape decoder for write_stdin `chars`
 ```
 
@@ -711,8 +757,11 @@ bash→powershell fallback both branches, WSL-stub exclusion, binary
 resolution caching), PTY loader guard (EXPECT_PTY assertion so a prebuild
 load failure is a red build, ConPTY disposal mock), and cmd.exe quoting
 e2e (operators, embedded quotes, %VAR%, parentheses, pipes), and codemode
-script results (`outputSchema`/`structuredContent` for all five tools plus an
-offline actual-Pi codemode run through Pi's collapsed renderer).
+script results (`outputSchema`/`structuredContent` for all five tools), native
+codemode renderer cache/width/expansion, and offline actual-CLI parity for
+settings, default activation, explicit opt-out, store/load and local-stdio MCP.
+Real-tmux acceptance also exercises object/settled/multiline script output at
+40/80/100 columns, regular/fullscreen, three themes and spill-path recovery.
 
 CI runs the suite on ubuntu, macos, and windows runners.
 

@@ -28,6 +28,7 @@ import { type AgentToolResult, type AgentToolUpdateCallback, type ExtensionAPI, 
 import { Type, type TUnsafe } from "typebox";
 
 import type { CollectResult } from "./collect.ts";
+import { registerCompactCodemode } from "./codemode-render.ts";
 import { CompletionCoordinator, type OnExitPolicy, sanitizeMeta } from "./completion.ts";
 import { formatElapsed } from "./format-time.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
@@ -1393,4 +1394,8 @@ export default function (pi: ExtensionAPI) {
 		renderCall: renderListSessionsCall,
 		renderResult: renderListSessionsResult,
 	});
+
+	// Native codemode remains inactive until normal defaultTools/CLI/MCP
+	// activation. This replaces presentation only, for every nested tool.
+	return registerCompactCodemode(pi);
 }

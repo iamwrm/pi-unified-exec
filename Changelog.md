@@ -2,6 +2,15 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 0.12.1 - 2026-09-30
+
+- Fix collapsed codemode output flooding by default. Reuse Pi's public `createCodemodeExtension()` factory and wrap only `renderResult`: cap the result text component at ten **visual rows** after wrapping, including nested-call summaries, spacers and footer. This also bounds `text(r)` and `text({ i, ...settled })`, not just `text(r.output)`.
+- Preserve native expanded output, small previews, call rendering, execution, typed results, settings/loadout, MCP activation and branch-local store/load. Unwrap the native cached component before delegation so streaming updates and expansion do not silently fall back to Pi's generic renderer.
+- Keep a configured expansion hint and `Full output:` recovery footer visible when clipping. Use a non-numeric clipping hint because Pi's native logical-line preview has already hidden output. The cap is display-only, not a change to model-visible content or process output bounds.
+- Add explicit opt-out `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` for alternative codemode replacements. The fix does not enable codemode or edit settings; disable the duplicate `builtin:codemode` in `pi config` to silence Pi's replacement warning. Applies to all codemode nested tools while this package is loaded.
+- Add permanent native-renderer, actual-CLI parity/default/opt-out/MCP and real-tmux A/B/C regressions; requalify the public factory, schema identity and renderer cache on Pi upgrades. No Pi core patch.
+- Validation on Linux / Node 24 / Pi 0.99.1: strict types and 342 tests pass (three Windows-only skips); all 21 real-tmux cases pass. The eight new CLI parity cases and all TUI cases also pass against the installed bundled CLI. Production dependency audit reports zero vulnerabilities; package dry-run includes the renderer module. No live model traffic.
+
 ## 0.12.0 - 2026-09-29
 
 - Give codemode scripts structured results. All five tools declare an `outputSchema` and return `structuredContent` (`src/script-result.ts`). Scripts receive `output` as a real multi-line string plus typed `exit_code`, `session_id`, `running`, `truncated` and `log_path`, instead of the whole text envelope. Previously, printing that string inside an object serialized its newlines, producing one logical line that Pi's five-line codemode preview could not bound (22 rows for 40 short lines at width 80).
