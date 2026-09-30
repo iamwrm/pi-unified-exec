@@ -225,10 +225,12 @@ as defense for legacy results and fallback content.
 
 `src/render.ts` owns the process-tool renderers. `src/codemode-render.ts` wraps
 Pi's native codemode result renderer, default-on, without changing its executor,
-schema identity, loadout or persistence. Add or update the corresponding
+schema identity, loadout or persistence. It registers at the first
+`session_start`, never during loading: a load-time `codemode` makes Pi skip
+`builtin:codemode` and warn every user. Add or update the corresponding
 `tests/{render,codemode-render,codemode-cli}.test.ts`; run `npm run test:tui`
-for actual CLI rendering. `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out of the
-codemode replacement; re-enable the built-in when opting out.
+for actual CLI rendering. `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out and
+leaves the still-loaded built-in in use.
 
 Never pass the collapsed wrapper as native `context.lastComponent`: Pi's
 renderer expects its `Text` and calls `.setText()`. Unwrap the cached `inner`
@@ -315,11 +317,14 @@ As of 2026-08-04 the surface is:
 - **`ExtensionContext` fields** (via the `ctx` / `eventCtx` argument):
   `ui.notify`, `cwd`, `hasUI`
 
-The 0.12.1 codemode wrapper additionally consumes `createCodemodeExtension`,
-`CodemodeToolDetails`, `ToolDefinition`, `Component`, `truncateToWidth`, and
-the native factory's API forwarding (`getSettings`, `getAllTools`,
-`appendEntry`). On each Pi upgrade verify `builtin:codemode` replacement and
-exclusion, exact parameter-schema identity, inactive default, mode/budget
+The codemode wrapper additionally consumes `createCodemodeExtension`,
+`CodemodeToolDetails`, `ToolDefinition`, `Component`, `truncateToWidth`,
+`getActiveTools`/`setActiveTools`, `SourceInfo.path`, and the native factory's
+API forwarding (`getSettings`, `getAllTools`, `appendEntry`). On each Pi
+upgrade verify that session-start registration still shadows the loaded
+`builtin:codemode` without a warning (first extension in load order wins;
+configured packages precede built-ins), the legacy-exclusion `defaultTools`
+activation, exact parameter-schema identity, inactive default, mode/budget
 loadout, nested/model helpers, store persistence and cached renderer shape.
 Run both codemode test files and actual tmux expansion/collapse; a silent
 generic fallback is a failure, not acceptable compatibility.

@@ -10,6 +10,9 @@ import extensionFactory from "../src/index.ts";
 import { isPtyAvailable } from "../src/pty.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 
+// Process-tool harness: the fake API has no codemode surfaces (see codemode-render tests).
+process.env.PI_UNIFIED_EXEC_COMPACT_CODEMODE = "0";
+
 /**
  * True when a real python3 exists. On Windows the "python3" on PATH may be
  * the WindowsApps Store stub, which stays alive without being a REPL — so

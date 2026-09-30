@@ -2,6 +2,16 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 0.12.2 - 2026-09-30
+
+- Remove Pi's replacement warning for everyone. 0.12.1 registered `codemode` during extension loading, so Pi skipped `builtin:codemode` and told every user of this package to disable it. The compact codemode replacement now registers at the first `session_start`, following Pi's `dynamic-tools.ts` pattern. Pi keeps the built-in loaded, and its tool registry uses the first extension in load order, where configured packages precede built-ins. The fix stays default-on with no settings; the built-in becomes the automatic fallback when it is off or fails.
+- Verify precedence at session start through `pi.getAllTools()` source info. If another extension's codemode wins, warn instead of silently claiming the fix is active.
+- A missing native codemode result renderer no longer throws from the extension factory, which would have unloaded all five exec tools. The package registers native codemode unchanged and warns at session start.
+- Legacy `-builtin:codemode` exclusion from 0.12.1: Pi resolves `defaultTools` before session start and drops the then-unknown `codemode`. When no built-in codemode was shadowed, apply the last `defaultTools` entry naming codemode and activate it. Declarations match native apart from codemode's position. The exclusion is no longer recommended.
+- `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` remains the only opt-out.
+- Tests: session-start registration and idempotence, precedence-loss warning, `defaultTools` rule and legacy activation. Actual-CLI parity now covers the default (built-in enabled) and legacy exclusion; real-tmux cases assert no replacement warning in any configuration and clip with the built-in enabled.
+- Validation on Linux / Node 24 / Pi 0.99.1: strict types, `EXPECT_PTY=1 npm test` and all 21 real-tmux cases pass. No live model traffic.
+
 ## 0.12.1 - 2026-09-30
 
 - Fix collapsed codemode output flooding by default. Reuse Pi's public `createCodemodeExtension()` factory and wrap only `renderResult`: cap the result text component at ten **visual rows** after wrapping, including nested-call summaries, spacers and footer. This also bounds `text(r)` and `text({ i, ...settled })`, not just `text(r.output)`.

@@ -20,6 +20,9 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 
+// Process-tool harness: the fake API has no codemode surfaces (see codemode-render tests).
+process.env.PI_UNIFIED_EXEC_COMPACT_CODEMODE = "0";
+
 interface ToolDef {
 	name: string;
 	execute: (

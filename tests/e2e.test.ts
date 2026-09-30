@@ -14,6 +14,9 @@ import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 
+// Process-tool harness: the fake API has no codemode surfaces (see codemode-render tests).
+process.env.PI_UNIFIED_EXEC_COMPACT_CODEMODE = "0";
+
 interface ToolDef {
 	name: string;
 	description: string;

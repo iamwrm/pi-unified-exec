@@ -3,14 +3,23 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import activate from "../src/index.ts";
 
+// This minimal fake API has no codemode surfaces; codemode-render tests cover them.
+process.env.PI_UNIFIED_EXEC_COMPACT_CODEMODE = "0";
+
 for (const keep of [false, true]) {
 	test(`current registered flag name controls builtin bash: ${keep}`, async () => {
-		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void>>();
+		type Handler = (event: unknown, ctx: ExtensionContext) => Promise<void>;
+		const registered = new Map<string, Handler[]>();
+		// Pi keeps every handler an extension registers for an event.
+		const handlers = { has: (name: string) => registered.has(name), get: (name: string) => {
+			const list = registered.get(name);
+			return list && (async (event: unknown, ctx: ExtensionContext) => { for (const handler of list) await handler(event, ctx); });
+		} };
 		const lookups: string[] = [];
 		let active = ["bash", "read", "exec_command"];
 		activate({
 			registerTool: () => {}, registerCommand: () => {}, registerFlag: () => {},
-			on: (name: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) => { handlers.set(name, handler); },
+			on: (name: string, handler: Handler) => { registered.set(name, [...(registered.get(name) ?? []), handler]); },
 			getFlag: (name: string) => { lookups.push(name); assert.equal(name, "keep-builtin-bash"); return keep; },
 			getActiveTools: () => active,
 			setActiveTools: (names: string[]) => { active = names; },

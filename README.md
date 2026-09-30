@@ -56,8 +56,9 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   `log_path`.
 - **Default-on compact codemode previews.** A display-only wrapper bounds
   collapsed codemode results to ten visual rows, including object/settled
-  output from any nested tool. Native execution and expansion are unchanged;
-  `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out for other codemode replacements.
+  output from any nested tool. Native execution and expansion are unchanged,
+  no settings are needed, and Pi prints no replacement warning;
+  `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out.
 - **Ctrl-C and other control bytes, not just stdin text.**
   `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
   `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
@@ -396,46 +397,46 @@ serializes newlines as `\n` and turns the output into one long line.
 
 Model-visible `content` and persisted `details` are unchanged.
 
-### Default-on codemode display fix (0.12.1)
+### Default-on codemode display fix (0.12.1; warning-free since 0.12.2)
 
 Pi 0.99.1's collapsed codemode preview counts logical lines before wrapping.
 `text(r)` or `text({ i, ...settled })` creates one long JSON line, which can
-wrap across the screen even though the result is collapsed. This package now
-uses Pi's public codemode factory and changes **only its result renderer**:
-after native wrapping, the collapsed result text component is capped at ten
-visual rows, including nested-call summaries, spacers and footer. Small native
-previews and expanded output stay unchanged. A configured expansion hint and
-`Full output:` recovery footer remain visible when clipping; long footer paths
-are width-truncated, with the complete path retained on expansion.
+wrap across the screen even though the result is collapsed. This package
+registers codemode from Pi's public codemode factory and changes **only its
+result renderer**: after native wrapping, the collapsed result text component
+is capped at ten visual rows, including nested-call summaries, spacers and
+footer. Small native previews and expanded output stay unchanged. A configured
+expansion hint and `Full output:` recovery footer remain visible when clipping;
+long footer paths are width-truncated, with the complete path retained on
+expansion.
 
-This applies to **all codemode nested tools**, not only unified-exec. It does
+**No setup.** The replacement is registered at session start, following Pi's
+dynamic-tools pattern, so Pi keeps `builtin:codemode` loaded and prints no
+replacement warning. Pi's tool registry uses the first extension in load order,
+and configured packages load before built-ins, so this codemode is the one in
+use; the built-in is the automatic fallback whenever this fix is off or fails.
+If another extension's codemode takes precedence, or a future Pi has no native
+result renderer to wrap, the package warns at session start and native display
+remains.
+
+The fix applies to **all codemode nested tools**, not only unified-exec. It does
 not activate codemode, rewrite script/model results, change process output
 bounds, patch Pi, or write your settings. The script-call renderer and separate
-inline image components are outside this result-text cap.
+inline image components are outside this result-text cap. The replacement
+honors `defaultTools: ["+codemode"]`, CLI tool selection, `codemode.mode`,
+`codemode.inlineBudget`, native MCP activation and branch-local store/load.
 
-**One-time setup to silence the duplicate built-in warning:** disable
-`codemode` under Built-in in `pi config`, or add this exclusion to your settings
-without dropping existing entries:
-
-```json
-{ "extensions": ["-builtin:codemode"] }
-```
-
-The replacement still honors `defaultTools: ["+codemode"]`, CLI tool selection,
-`codemode.mode`, `codemode.inlineBudget`, native MCP activation and branch-local
-store/load. Leaving both extensions enabled produces Pi's replacement warning;
-only the replacement is retained. `/reload` or restart after configuration
-changes.
+**Upgrading from 0.12.1:** its `"-builtin:codemode"` exclusion is no longer
+needed; remove it (or re-enable `codemode` under Built-in in `pi config`) so the
+built-in stays available as a fallback. With the exclusion kept, the package
+still supplies codemode and applies `defaultTools` itself, appending codemode
+after the other active tools.
 
 **Explicit opt-out**, for a different codemode replacement or native display:
 
 ```bash
 PI_UNIFIED_EXEC_COMPACT_CODEMODE=0 pi
 ```
-
-When opting out, re-enable `builtin:codemode` (remove the exclusion above) unless
-another extension supplies codemode. The display fix is on by default; no flag
-or setting is needed to opt in.
 
 ## TUI rendering
 
@@ -759,7 +760,7 @@ load failure is a red build, ConPTY disposal mock), and cmd.exe quoting
 e2e (operators, embedded quotes, %VAR%, parentheses, pipes), and codemode
 script results (`outputSchema`/`structuredContent` for all five tools), native
 codemode renderer cache/width/expansion, and offline actual-CLI parity for
-settings, default activation, explicit opt-out, store/load and local-stdio MCP.
+settings, default activation with and without the legacy exclusion, explicit opt-out, store/load and local-stdio MCP.
 Real-tmux acceptance also exercises object/settled/multiline script output at
 40/80/100 columns, regular/fullscreen, three themes and spill-path recovery.
 

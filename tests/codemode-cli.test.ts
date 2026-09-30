@@ -11,8 +11,9 @@ const cli = process.env.PI_UNIFIED_EXEC_TEST_CLI ?? fileURLToPath(new URL("../no
 const extension = fileURLToPath(new URL("../src/index.ts", import.meta.url));
 const provider = fileURLToPath(new URL("./fixtures/codemode-provider.js", import.meta.url));
 const mcpFixture = fileURLToPath(new URL("./fixtures/codemode-mcp.mjs", import.meta.url));
-type RunOptions = { fixed?: boolean; pattern?: string; mode?: "on" | "only"; budget?: number; active?: boolean; mcp?: boolean; packageEnabled?: boolean };
-function run({ fixed = true, pattern = "parity", mode = "on", budget = 3000, active = true, mcp = false, packageEnabled = true }: RunOptions = {}) {
+type RunOptions = { fixed?: boolean; pattern?: string; mode?: "on" | "only"; budget?: number; active?: boolean; mcp?: boolean; packageEnabled?: boolean; exclude?: boolean };
+// `fixed` is the default; `exclude` is the 0.12.1-era `-builtin:codemode` setup.
+function run({ fixed = true, pattern = "parity", mode = "on", budget = 3000, active = true, mcp = false, packageEnabled = true, exclude = false }: RunOptions = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-exec-codemode-"));
 	try {
 		const agentDir = join(root, "agent");
@@ -20,7 +21,7 @@ function run({ fixed = true, pattern = "parity", mode = "on", budget = 3000, act
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
 			cacheWarming: "off", defaultProjectTrust: "always", compaction: { enabled: false }, retry: { enabled: false }, enableAnalytics: false, enableInstallTelemetry: false,
 			...(active ? { defaultTools: ["+codemode"] } : {}), codemode: { mode, inlineBudget: budget },
-			extensions: fixed && packageEnabled ? ["-builtin:codemode"] : [],
+			extensions: exclude ? ["-builtin:codemode"] : [],
 		}));
 		const capture = join(root, "requests.jsonl");
 		const child = spawnSync(process.execPath, [
@@ -51,6 +52,13 @@ for (const mode of ["on", "only"] as const) for (const budget of [0, 3000]) {
 	test(`codemode CLI native parity: ${mode}, budget ${budget}`, { timeout: 30_000 }, () => {
 		const native = run({ fixed: false, mode, budget });
 		const fixed = run({ mode, budget });
+		const excluded = run({ mode, budget, exclude: true });
+		assert.deepEqual(normalizedContent(excluded.ends), normalizedContent(native.ends));
+		// Legacy exclusion: Pi dropped `+codemode` at startup, so the late
+		// activation appends it; declarations match apart from their order.
+		const byName = (requests: any[]) => declarations(requests).map((tools: any[]) => [...tools].sort((a, b) => a.name.localeCompare(b.name)));
+		assert.deepEqual(byName(excluded.requests), byName(native.requests));
+		assert.doesNotMatch(excluded.stderr, /was not loaded|registers tool|conflict/i);
 		assert.deepEqual(normalizedContent(fixed.ends), normalizedContent(native.ends));
 		assert.deepEqual(declarations(fixed.requests), declarations(native.requests));
 		assert.equal(fixed.ends.length, 3);

@@ -40,10 +40,13 @@ class CompactCodemodeResult implements Component {
 	}
 }
 
-/** Preserve the whole native definition, including MCP's parameter-schema identity. */
+/**
+ * Preserve the whole native definition, including MCP's parameter-schema identity.
+ * Without a native result renderer there is nothing to bound: return it as is.
+ */
 export function compactCodemodeDefinition(definition: CodemodeDefinition): CodemodeDefinition {
 	const renderResult = definition.renderResult;
-	if (!renderResult) throw new Error("unified-exec: native codemode result renderer missing");
+	if (!renderResult) return definition;
 	return {
 		...definition,
 		renderResult(result, options, theme, context) {
@@ -58,21 +61,63 @@ export function compactCodemodeDefinition(definition: CodemodeDefinition): Codem
 	};
 }
 
-/** Default-on presentation fix; does not activate codemode or write settings. */
-export function registerCompactCodemode(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void | Promise<void> {
+/** Whether the last `defaultTools` entry naming codemode enables it (`codemode` or `+codemode`). */
+export function defaultToolsWantCodemode(defaultTools: readonly string[] | undefined): boolean {
+	const entry = [...(defaultTools ?? [])].reverse().find((name) => name.replace(/^[+-]/, "") === "codemode");
+	return entry === "codemode" || entry === "+codemode";
+}
+
+/**
+ * Default-on presentation fix; does not activate codemode or write settings.
+ *
+ * Registration waits for the first `session_start`, as in Pi's dynamic-tools
+ * example. A load-time `codemode` makes Pi skip `builtin:codemode` and warn
+ * every user; registered later, both stay loaded and Pi's registry keeps the
+ * first extension in load order, where configured packages precede built-ins.
+ * The built-in therefore remains the fallback whenever this fix is off, fails
+ * or loses precedence. Loaded before the first request, so the initial tool
+ * set already contains the replacement.
+ */
+export function registerCompactCodemode(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
 	if (env[COMPACT_CODEMODE_ENV] === "0") return;
+	let registered = false;
+	let degraded = false;
 	// Use Pi's public factory, not a copy of its executor/loadout/store logic.
 	// Bind forwarding methods to the real API so their receivers stay intact.
 	const api = new Proxy(pi, {
 		get(target, property) {
 			if (property === "registerTool") {
-				return (definition: CodemodeDefinition) => target.registerTool(
-					definition.name === "codemode" ? compactCodemodeDefinition(definition) : definition,
-				);
+				return (definition: CodemodeDefinition) => {
+					if (definition.name !== "codemode") return target.registerTool(definition);
+					// Never drop codemode itself: degrade to the native display instead.
+					degraded = !definition.renderResult;
+					return target.registerTool(compactCodemodeDefinition(definition));
+				};
 			}
 			const value = Reflect.get(target, property, target);
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	});
-	return createCodemodeExtension()(api);
+	pi.on("session_start", async (_event, ctx) => {
+		// The extension instance survives new/resume/fork; reload creates a new one.
+		if (registered) return;
+		registered = true;
+		const shadowing = pi.getAllTools().some((tool) => tool.name === "codemode");
+		createCodemodeExtension()(api);
+		// Without builtin:codemode (the 0.12.1 advice), Pi resolved defaultTools
+		// before this registration and dropped `+codemode`: apply it here. A
+		// `--tools` selection needs nothing: Pi activates or filters named tools.
+		const active = pi.getActiveTools();
+		if (!shadowing && !active.includes("codemode") && defaultToolsWantCodemode(pi.getSettings().defaultTools)
+			&& pi.getAllTools().some((tool) => tool.name === "codemode")) {
+			pi.setActiveTools([...active, "codemode"]);
+		}
+		// Precedence is Pi's load order, not an API contract: report a loss.
+		const tools = pi.getAllTools();
+		const owner = tools.find((tool) => tool.name === "codemode")?.sourceInfo.path;
+		const ours = tools.find((tool) => tool.name === "exec_command")?.sourceInfo.path;
+		const reason = degraded ? "native codemode renderer not found"
+			: owner !== ours ? `codemode from ${owner ?? "another extension"} takes precedence` : undefined;
+		if (reason && ctx.hasUI) ctx.ui.notify(`unified-exec: ${reason}; compact codemode previews are off`, "warning");
+	});
 }

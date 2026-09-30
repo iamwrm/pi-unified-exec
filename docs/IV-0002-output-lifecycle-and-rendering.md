@@ -65,9 +65,10 @@ The initiative establishes a durable output contract across these layers:
   default, settings/loadout, MCP auto-activation, model helpers and store/load.
 - Unwrap cached native components before calling the original renderer; Pi
   catches renderer exceptions and can silently expose the unbounded fallback.
-- Default-on codemode replacement must not write settings or activate the tool.
-  Offer only explicit opt-out `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0`; document
-  duplicate built-in exclusion and re-enabling it when opting out.
+- Default-on codemode replacement must not write settings or activate the tool
+  beyond `defaultTools`. Register at session start so Pi keeps the built-in
+  loaded and never warns; verify precedence and warn on loss. Offer only
+  explicit opt-out `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0`.
 
 ## Decisions
 
@@ -83,6 +84,7 @@ The initiative establishes a durable output contract across these layers:
 | Require Pi 0.99.1 for 0.12.0 | `outputSchema`/`structuredContent` do not exist in earlier Pi types. Older Pi users stay on 0.11.x. |
 | Keep complete logs for now | Archive bounding/retention is a separate policy change and remains follow-up work. |
 | Bundle the native codemode display fix by default in 0.12.1 | Owner requested the fix here, not a separate package. It applies globally to nested tools while unified-exec is loaded; no Pi core patch or executor fork. |
+| Register codemode at session start in 0.12.2 | Load-time registration made Pi skip `builtin:codemode` and warn every package user. Session-start registration is Pi's documented dynamic-tool pattern; load order keeps this definition first, the built-in stays as fallback, and precedence is checked at runtime. |
 | Wrap the public factory via a receiver-bound API proxy | Keep native execution/schema/loadout/persistence and method receivers intact; intercept only tool registration and result rendering. |
 | Keep native ordering and clip the rendered head at ten rows | Bound the whole result text component. Call summaries can consume the budget; reserve recovery/hint footer space. Script-call and separate image components are outside this cap. |
 | Use a non-numeric clipping hint | Native rendering has already hidden logical lines, so its rendered row count is not the full-output hidden-row count. |
@@ -98,7 +100,7 @@ The initiative establishes a durable output contract across these layers:
 | Explicit renderers and shared five-line preview | `src/render.ts` |
 | Native codemode factory/renderer wrapper | `src/codemode-render.ts`; registration from `src/index.ts` |
 | Codemode width/cache/schema and real-CLI parity | `tests/codemode-render.test.ts`, `tests/codemode-cli.test.ts` |
-| Real codemode TUI A/B/C, opt-out, warning and recovery | `tests/tui-codemode.test.mjs`, `tests/fixtures/codemode-*` |
+| Real codemode TUI A/B/C, opt-out, no-warning, legacy exclusion and recovery | `tests/tui-codemode.test.mjs`, `tests/fixtures/codemode-*` |
 | Pure output and terminal-safety tests | `tests/{tool-result,output-safety}.test.ts` |
 | Collapse/expand/list/legacy-safety renderer tests | `tests/render.test.ts` |
 | Real delayed noisy-kill regression | `tests/e2e.test.ts` |
@@ -145,7 +147,7 @@ At 100×60, native object/settled result text components took 20/21 rows;
 the wrapper takes at most ten including summaries/spacers/footer. Multiline
 output keeps the original 36-more-lines hint when it fits. Actual CLI gates
 compare content after normalizing only the elapsed-time header, plus native
-declarations, mode/budget, default/opt-out/MCP activation, search/model helpers
+declarations, mode/budget, default/legacy-exclusion/opt-out/MCP activation, search/model helpers
 and all store entries. TUI gates exercise Ctrl+O expansion and recollapse at
 40/80/100 columns, regular/fullscreen and dark/system/light themes, with no
 generic renderer fallback. Re-run on Pi upgrades; local TUI evidence is Linux,

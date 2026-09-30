@@ -1395,7 +1395,7 @@ export default function (pi: ExtensionAPI) {
 		renderResult: renderListSessionsResult,
 	});
 
-	// Native codemode remains inactive until normal defaultTools/CLI/MCP
-	// activation. This replaces presentation only, for every nested tool.
-	return registerCompactCodemode(pi);
+	// Shadows native codemode at session start without replacing
+	// builtin:codemode. Presentation only, for every nested tool.
+	registerCompactCodemode(pi);
 }

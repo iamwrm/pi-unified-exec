@@ -41,7 +41,7 @@ function resultBody(text, toolName) {
 	return body;
 }
 let serial = 0;
-async function run({ fixed = true, width = 100, pattern = "A", mode = "regular", disableNative = fixed, theme = "dark" } = {}) {
+async function run({ fixed = true, width = 100, pattern = "A", mode = "regular", disableNative = false, theme = "dark" } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-exec-codemode-tui-"));
 	const name = `case-${serial++}`;
 	let started = false;
@@ -53,7 +53,7 @@ async function run({ fixed = true, width = 100, pattern = "A", mode = "regular",
 			cacheWarming: "off", defaultProjectTrust: "always", compaction: { enabled: false }, retry: { enabled: false }, enableAnalytics: false, enableInstallTelemetry: false,
 			defaultTools: ["+codemode"], extensions: disableNative ? ["-builtin:codemode"] : [],
 		}));
-		// Fixed cases have NO opt-in setting: remove any inherited opt-out.
+		// Fixed cases use the default: remove any inherited environment opt-out.
 		const argv = ["env", "-u", envKey, `HOME=${root}`, `TMPDIR=${root}`, `PI_CODING_AGENT_DIR=${agentDir}`, "PI_OFFLINE=1", `EXEC_CODEMODE_PATTERN=${pattern}`,
 			...(fixed ? [] : [`${envKey}=0`]), process.execPath, cli, "--no-session", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
 			"--tui-mode", mode, "--use-theme", theme, "-e", provider, "-e", extension,
@@ -64,8 +64,8 @@ async function run({ fixed = true, width = 100, pattern = "A", mode = "regular",
 		pid = Number(tmux("display-message", "-p", "-t", name, "#{pane_pid}").trim());
 		const collapsed = await completed(name);
 		assert.doesNotMatch(collapsed, /Script (completed|failed)/, "a renderer exception must not be hidden by Pi's fallback");
-		if (disableNative) assert.doesNotMatch(collapsed, /was not loaded|registers tool/);
-		else if (fixed) assert.match(collapsed, /was not loaded|not loaded/);
+		// Session-start shadowing never replaces builtin:codemode, so Pi never warns.
+		assert.doesNotMatch(collapsed, /was not loaded|registers tool|conflict|takes precedence/);
 		const toolName = pattern === "spill" ? "sample" : "exec_command";
 		const body = resultBody(collapsed, toolName);
 		// The native result also owns one blank row before the call summaries.
@@ -100,5 +100,5 @@ for (const pattern of ["A", "B", "C"]) {
 }
 for (const pattern of ["A", "B", "C"]) test(`codemode TUI: ${pattern}, fullscreen 80x60`, options, () => run({ pattern, width: 80, mode: "fullscreen" }));
 test("codemode TUI: clipping retains full-output recovery footer", options, () => run({ pattern: "spill", width: 80 }));
-test("codemode TUI: duplicate built-in warning without exclusion", options, () => run({ disableNative: false }));
+test("codemode TUI: legacy -builtin:codemode exclusion still clips", options, () => run({ disableNative: true }));
 for (const theme of ["system", "light"]) test(`codemode TUI: default-on ${theme} theme`, options, () => run({ theme }));
