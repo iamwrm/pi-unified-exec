@@ -41,28 +41,37 @@ for (const width of [20, 40, 80, 100]) {
 	test(`codemode object and settled JSON bounded at width ${width}`, () => {
 		for (const text of [JSON.stringify({ status: "exited", output, exit_code: 0 }), JSON.stringify({ i: 0, status: "fulfilled", value: { output } })]) {
 			const result = resultOf(text);
-			assert.ok(original.renderResult!(result, options, theme, context()).render(width).length > CODEMODE_PREVIEW_ROWS);
+			const nativeRows = original.renderResult!(result, options, theme, context()).render(width);
 			const { rows } = bounded(result, width);
-			assert.match(rows.at(-1)!, width >= 40 ? /clipped/ : /ctrl\+o/);
+			if (nativeRows.length <= CODEMODE_PREVIEW_ROWS) assert.deepEqual(rows, nativeRows);
+			else assert.match(rows.at(-1)!, width >= 40 ? /clipped/ : /ctrl\+o/);
 			assert.doesNotMatch(rows.at(-1)!, /\d+ more rows/);
 		}
 	});
 	test(`codemode ANSI and wide Unicode bounded at width ${width}`, () => {
 		bounded(resultOf("\x1b[31m" + "中文🙂".repeat(500) + "\x1b[0m"), width);
 	});
-	test(`codemode native logical-line hint preserved at width ${width}`, () => {
+	test(`codemode native preview preserved at width ${width}`, () => {
 		const result = resultOf("exit 0\n" + output);
 		const nativeRows = original.renderResult!(result, options, theme, context()).render(width);
 		const { rows } = bounded(result, width);
 		if (nativeRows.length <= CODEMODE_PREVIEW_ROWS) assert.deepEqual(rows, nativeRows);
 		else assert.match(rows.at(-1)!, width >= 40 ? /clipped/ : /ctrl\+o/);
-		assert.equal(rows.filter(row => /ctrl\+o/.test(row)).length, 1);
+		if (nativeRows.length > CODEMODE_PREVIEW_ROWS || width >= 40) {
+			assert.equal(rows.filter(row => /ctrl\+o/.test(row)).length, 1);
+		}
 	});
 	test(`codemode spill recovery footer visible at width ${width}`, () => {
 		const result = resultOf(JSON.stringify({ output }) + "\n\n[Full output: /tmp/pi-codemode-1234abcd.txt (read with offset/limit)]", { calls: [], fullOutputPath: "/tmp/pi-codemode-1234abcd.txt" });
+		const nativeRows = original.renderResult!(result, options, theme, context()).render(width);
 		const { rows } = bounded(result, width);
-		assert.match(rows.at(-1)!, /^Full output:/);
-		assert.match(rows.at(-2)!, width >= 40 ? /clipped/ : /ctrl\+o/);
+		if (nativeRows.length <= CODEMODE_PREVIEW_ROWS) {
+			assert.deepEqual(rows, nativeRows);
+			assert.match(rows.join(""), /Full output:/);
+		} else {
+			assert.match(rows.at(-1)!, /^Full output:/);
+			assert.match(rows.at(-2)!, width >= 40 ? /clipped/ : /ctrl\+o/);
+		}
 	});
 }
 
@@ -99,7 +108,11 @@ test("codemode partial -> final -> redraw -> expand -> collapse preserves native
 test("codemode many nested calls, errors and partial updates stay bounded", () => {
 	for (const isPartial of [true, false]) {
 		const calls = Array.from({ length: 30 }, (_, i) => ({ id: `test/${i}`, name: "read", args: JSON.stringify({ path: "x".repeat(200) }), status: i === 29 ? "error" as const : "ok" as const, error: "ERR" }));
-		const component = wrapped.renderResult!(resultOf(JSON.stringify({ output }), { calls }), { expanded: false, isPartial }, theme, context({ isPartial, isError: true }));
+		const result = resultOf(JSON.stringify({ output }), { calls });
+		const renderContext = context({ isPartial, isError: true });
+		assert.ok(original.renderResult!(result, { expanded: false, isPartial }, theme, renderContext).render(40).length > CODEMODE_PREVIEW_ROWS,
+			"native per-section previews do not cap the whole result with many call summaries");
+		const component = wrapped.renderResult!(result, { expanded: false, isPartial }, theme, renderContext);
 		assert.ok(component.render(40).length <= CODEMODE_PREVIEW_ROWS);
 	}
 });

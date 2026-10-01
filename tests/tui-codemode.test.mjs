@@ -61,6 +61,9 @@ async function run({ fixed = true, width = 100, pattern = "A", mode = "regular",
 		];
 		tmux("new-session", "-d", "-s", name, "-x", String(width), "-y", "60", "-c", root, "exec " + argv.map(quote).join(" "));
 		started = true;
+		// Keep startup warnings outside the measured result on an unconfigured host.
+		tmux("set-option", "-s", "extended-keys", "on");
+		tmux("set-option", "-s", "extended-keys-format", "csi-u");
 		pid = Number(tmux("display-message", "-p", "-t", name, "#{pane_pid}").trim());
 		const collapsed = await completed(name);
 		assert.doesNotMatch(collapsed, /Script (completed|failed)/, "a renderer exception must not be hidden by Pi's fallback");
@@ -70,9 +73,10 @@ async function run({ fixed = true, width = 100, pattern = "A", mode = "regular",
 		const body = resultBody(collapsed, toolName);
 		// The native result also owns one blank row before the call summaries.
 		if (fixed) assert.ok(body.length + 1 <= 10, `${body.length + 1} result rows:\n${collapsed}`);
-		else if (["A", "B"].includes(pattern)) assert.ok(body.length + 1 > 10, "opt-out must restore the unbounded native preview");
-		if (fixed && ["A", "B"].includes(pattern)) assert.match(body.join("\n"), /to expand \(clipped\)/);
-		if (pattern === "C" && width === 100) assert.match(body.join("\n"), /36 more lines, ctrl\+o to expand/);
+		// Native Pi may already bound these simple previews; opt-out must preserve
+		// native rendering, not reintroduce the old logical-line overflow.
+		if (fixed && ["A", "B"].includes(pattern)) assert.match(body.join("\n"), /to expand/);
+		if (pattern === "C" && width === 100) assert.match(body.join("\n"), /\d+ more lines, ctrl\+o to expand/);
 		if (pattern === "spill") assert.match(body.at(-1), /Full output:/);
 		tmux("send-keys", "-t", name, "C-o");
 		await pause(350);
@@ -100,5 +104,5 @@ for (const pattern of ["A", "B", "C"]) {
 }
 for (const pattern of ["A", "B", "C"]) test(`codemode TUI: ${pattern}, fullscreen 80x60`, options, () => run({ pattern, width: 80, mode: "fullscreen" }));
 test("codemode TUI: clipping retains full-output recovery footer", options, () => run({ pattern: "spill", width: 80 }));
-test("codemode TUI: legacy -builtin:codemode exclusion still clips", options, () => run({ disableNative: true }));
+test("codemode TUI: legacy -builtin:codemode exclusion stays bounded", options, () => run({ disableNative: true }));
 for (const theme of ["system", "light"]) test(`codemode TUI: default-on ${theme} theme`, options, () => run({ theme }));

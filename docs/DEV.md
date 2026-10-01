@@ -233,10 +233,11 @@ for actual CLI rendering. `PI_UNIFIED_EXEC_COMPACT_CODEMODE=0` opts out and
 leaves the still-loaded built-in in use.
 
 Never pass the collapsed wrapper as native `context.lastComponent`: Pi's
-renderer expects its `Text` and calls `.setText()`. Unwrap the cached `inner`
+renderer expects its own component, a `Container` using `.clear()` in Pi
+0.99.2, previously a `Text` using `.setText()`. Unwrap the cached `inner`
 component before delegation, preserve invalidation and return native expanded
 output. Keep spill-path recovery and configured expansion hints visible within
-the row cap; do not claim a hidden-row count after native logical-line clipping.
+the row cap; do not claim a hidden-row count after native preview truncation.
 
 ## Debugging aids
 
@@ -392,7 +393,8 @@ git commit -m "unified-exec: verify compat with pi-coding-agent <new-version>"
 ```
 
 The coding-agent peer minimum stays at the oldest version whose lifecycle and
-renderer APIs are actually supported (`>=0.80.5` today); exact dev pins govern
+renderer and structured-result APIs are actually supported (`>=0.99.1` today);
+exact dev pins govern
 the host version we typecheck and test against.
 
 ## Releasing to npm

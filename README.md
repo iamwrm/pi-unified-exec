@@ -401,8 +401,10 @@ Model-visible `content` and persisted `details` are unchanged.
 
 Pi 0.99.1's collapsed codemode preview counts logical lines before wrapping.
 `text(r)` or `text({ i, ...settled })` creates one long JSON line, which can
-wrap across the screen even though the result is collapsed. This package
-registers codemode from Pi's public codemode factory and changes **only its
+wrap across the screen even though the result is collapsed. Pi 0.99.2 bounds
+individual preview sections by visual lines, but many nested-call summaries
+can still exceed a whole-result limit. This package registers codemode from
+Pi's public codemode factory and changes **only its
 result renderer**: after native wrapping, the collapsed result text component
 is capped at ten visual rows, including nested-call summaries, spacers and
 footer. Small native previews and expanded output stay unchanged. A configured

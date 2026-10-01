@@ -24,7 +24,7 @@ class CompactCodemodeResult implements Component {
 		if (width <= 0) return [];
 		const rows = this.inner.render(width);
 		if (rows.length <= CODEMODE_PREVIEW_ROWS) return rows;
-		// Native collapsed rendering has already hidden logical lines. Its row
+		// Native collapsed rendering has already hidden output. Its row
 		// count cannot tell us the total hidden output; use a non-numeric hint.
 		const hint = this.theme.fg("muted", "... ") + keyHint("app.tools.expand", "to expand")
 			+ this.theme.fg("muted", " (clipped)");
@@ -50,8 +50,8 @@ export function compactCodemodeDefinition(definition: CodemodeDefinition): Codem
 	return {
 		...definition,
 		renderResult(result, options, theme, context) {
-			// Native codemode reuses its Text via lastComponent.setText(). Never
-			// pass our wrapper back: Pi would catch the error and use a fallback.
+			// Native codemode owns its cached component, now a Container in Pi 0.99.2.
+			// Never pass our wrapper back: Pi would catch the error and use a fallback.
 			const lastComponent = context.lastComponent instanceof CompactCodemodeResult
 				? context.lastComponent.inner : context.lastComponent;
 			const inner = renderResult(result, options, theme, { ...context, lastComponent });

@@ -33,8 +33,10 @@ The initiative establishes a durable output contract across these layers:
    preview could not bound.
 5. **Codemode presentation (0.12.1):** by default register Pi's native codemode
    definition with a result-renderer-only decorator. Compact JSON from
-   `text(r)` / settled results is one logical line and can still flood native
-   previews. Bound actual rendered rows at ten, including call summaries,
+   `text(r)` / settled results flooded Pi 0.99.1's logical-line previews.
+   Pi 0.99.2 bounds individual sections by visual lines, but does not bound
+   many nested-call summaries as one result. Bound rendered rows at ten,
+   including call summaries,
    spacers, clipping hint and native full-output-path footer; leave expanded
    output and all model/script data native.
 
@@ -87,7 +89,7 @@ The initiative establishes a durable output contract across these layers:
 | Register codemode at session start in 0.12.2 | Load-time registration made Pi skip `builtin:codemode` and warn every package user. Session-start registration is Pi's documented dynamic-tool pattern; load order keeps this definition first, the built-in stays as fallback, and precedence is checked at runtime. |
 | Wrap the public factory via a receiver-bound API proxy | Keep native execution/schema/loadout/persistence and method receivers intact; intercept only tool registration and result rendering. |
 | Keep native ordering and clip the rendered head at ten rows | Bound the whole result text component. Call summaries can consume the budget; reserve recovery/hint footer space. Script-call and separate image components are outside this cap. |
-| Use a non-numeric clipping hint | Native rendering has already hidden logical lines, so its rendered row count is not the full-output hidden-row count. |
+| Use a non-numeric clipping hint | Native rendering has already hidden output, so its rendered row count is not the full-output hidden-row count. |
 
 ## Implementation map
 
@@ -143,7 +145,7 @@ npx tsx --test tests/codemode-render.test.ts tests/codemode-cli.test.ts
 npm run test:tui
 ```
 
-At 100×60, native object/settled result text components took 20/21 rows;
+On Pi 0.99.1 at 100×60, native object/settled result text components took 20/21 rows;
 the wrapper takes at most ten including summaries/spacers/footer. Multiline
 output keeps the original 36-more-lines hint when it fits. Actual CLI gates
 compare content after normalizing only the elapsed-time header, plus native
@@ -151,7 +153,15 @@ declarations, mode/budget, default/legacy-exclusion/opt-out/MCP activation, sear
 and all store entries. TUI gates exercise Ctrl+O expansion and recollapse at
 40/80/100 columns, regular/fullscreen and dark/system/light themes, with no
 generic renderer fallback. Re-run on Pi upgrades; local TUI evidence is Linux,
-not live provider traffic or non-Linux terminal qualification.
+not live provider traffic or non-Linux terminal qualification. Pi 0.99.2
+macOS qualification is recorded below; it does not rewrite that release evidence.
+
+The local Pi 0.99.2 migration updates exact development pins while retaining
+`>=0.99.1` peers. Renderer tests accept native previews already within the cap,
+verify whole-result clipping for many summaries, and exercise native Container
+cache reuse. Tmux tests measure the isolated server with extended keys enabled
+to exclude host startup warnings. Runtime execution and rendering logic are
+unchanged. This is an unpublished checkout change, not an installed update.
 
 Local 0.12.1 release gate: `EXPECT_PTY=1 npm test` passes strict types and
 342 tests, with three Windows-only skips. `npm run test:tui` passes all 21

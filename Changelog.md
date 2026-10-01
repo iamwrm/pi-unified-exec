@@ -2,6 +2,13 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## Unreleased
+
+- Pin Pi-family development dependencies and locks to 0.99.2. Keep runtime peers at >=0.99.1; no newly required production API.
+- macOS strict types, EXPECT_PTY=1 npm test with 345 passes and three Windows-only skips, and all 21 real-tmux cases pass. Package dry-run includes the renderer; no live model traffic or publication.
+- Update renderer and tmux assertions for Pi 0.99.2's native visual-line previews and Container cache. Preserve the whole-result ten-row cap for many nested summaries.
+- Configure extended keys only on the isolated test tmux server to keep host startup warnings out of measured tool rows. Production rendering and execution are unchanged.
+
 ## 0.12.2 - 2026-09-30
 
 - Remove Pi's replacement warning for everyone. 0.12.1 registered `codemode` during extension loading, so Pi skipped `builtin:codemode` and told every user of this package to disable it. The compact codemode replacement now registers at the first `session_start`, following Pi's `dynamic-tools.ts` pattern. Pi keeps the built-in loaded, and its tool registry uses the first extension in load order, where configured packages precede built-ins. The fix stays default-on with no settings; the built-in becomes the automatic fallback when it is off or fails.
