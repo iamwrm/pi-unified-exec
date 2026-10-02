@@ -4,6 +4,12 @@ All notable changes to this project. **Newest entries go on top.**
 
 ## Unreleased
 
+- Pin Pi-family development dependencies and locks to 1.0.0, retaining >=0.99.1 peers. Production code and package version are unchanged.
+- Assert Pi's native codemode documentation reference instead of the retired inline model declaration. Add wrapped/native generated-image and model-usage parity plus unknown-member fail-fast tests with no live models.
+- macOS strict types, `EXPECT_PTY=1 npm test` with 348 passes and three Windows-only skips, and all 21 isolated real-tmux cases pass. No npm publication or installed-package replacement.
+
+## Pi 0.99.2 qualification - 2026-10-01
+
 - Pin Pi-family development dependencies and locks to 0.99.2. Keep runtime peers at >=0.99.1; no newly required production API.
 - macOS strict types, EXPECT_PTY=1 npm test with 345 passes and three Windows-only skips, and all 21 real-tmux cases pass. Package dry-run includes the renderer; no live model traffic or publication.
 - Update renderer and tmux assertions for Pi 0.99.2's native visual-line previews and Container cache. Preserve the whole-result ten-row cap for many nested summaries.

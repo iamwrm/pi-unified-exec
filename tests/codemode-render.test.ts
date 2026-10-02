@@ -165,7 +165,7 @@ test("codemode native factory forwards API receivers and preserves schema identi
 	assert.equal(pi.tools[0].parameters, original.parameters);
 	assert.equal(pi.tools[0].defaultActive, false);
 	const changes = pi.tools[0].prepareLoadout!({ declared: [], callable: [], registered: [], getExposure() { return "direct"; }, getNamespace() { return undefined; } });
-	assert.match(changes!.descriptions!.codemode, /getModelsOfType\(/);
+	assert.match(changes!.descriptions!.codemode, /Read .*codemode\.md first/);
 	assert.deepEqual(pi.notes, []);
 });
 
