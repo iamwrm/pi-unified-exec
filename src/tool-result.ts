@@ -48,7 +48,12 @@ export interface ProcessResultDetails extends OutputResultDetails {
 	status: ProcessStatus;
 	yield_time_ms?: number;
 	wait_mode?: "relative" | "absolute";
-	wait_status?: "completed" | "relative_deadline_reached" | "absolute_deadline_reached" | "cancelled";
+	wait_status?:
+		| "completed"
+		| "relative_deadline_reached"
+		| "absolute_deadline_reached"
+		| "cancelled"
+		| "interrupted_by_steer";
 	yield_until?: string;
 	effective_wait_ms?: number;
 	on_exit?: OnExitPolicy;

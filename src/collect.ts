@@ -47,6 +47,11 @@ export interface CollectInputs {
 	deadlineMs: number;
 	/** External abort (e.g. user pressed Esc). Breaks out immediately. */
 	externalAbort?: AbortSignal;
+	/**
+	 * Early deadline (a human steer is queued). Unlike externalAbort, the
+	 * currently buffered output is still drained and returned.
+	 */
+	stopSignal?: AbortSignal;
 	/** Override the trailing-output grace after exit (ms). */
 	postExitCloseWaitMs?: number;
 }
@@ -68,7 +73,7 @@ export interface CollectResult {
  * output arriving after we return stays in the buffer for the next collect().
  */
 export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise<CollectResult> {
-	const { buffer, outputNotify, outputClosed, exited, deadlineMs, externalAbort } = inputs;
+	const { buffer, outputNotify, outputClosed, exited, deadlineMs, externalAbort, stopSignal } = inputs;
 	const postExitCloseWaitCap = inputs.postExitCloseWaitMs ?? POST_EXIT_CLOSE_WAIT_MS;
 
 	const collected: Uint8Array[] = [];
@@ -91,6 +96,10 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 			? abortPromise(externalAbort, cleanups).then(() => "external" as const)
 			: new Promise<never>(() => {});
 		const deadlineP = timeoutPromise(deadlineMs - Date.now(), cleanups).then(() => "timeout" as const);
+		const stopP: Promise<"timeout"> = stopSignal
+			? abortPromise(stopSignal, cleanups).then(() => "timeout" as const)
+			: new Promise<never>(() => {});
+		const pastDeadline = () => Date.now() >= deadlineMs || stopSignal?.aborted === true;
 		let closedP: Promise<"closed"> | undefined;
 		let graceP: Promise<"timeout"> | undefined;
 
@@ -106,7 +115,7 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 				if (exitSignalReceived && outputClosed.isClosed) break;
 
 				const now = Date.now();
-				if (now >= deadlineMs) break;
+				if (pastDeadline()) break;
 
 				if (exitSignalReceived) {
 					// Process exited but stream not closed yet — give it a short grace.
@@ -131,6 +140,7 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 					outputNotify.notified().then(() => "output" as const),
 					exitedP,
 					deadlineP,
+					stopP,
 					externalP,
 				]);
 				if (which === "timeout" || which === "external") break;
@@ -148,7 +158,7 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 			for (const chunk of drained.tail) collected.push(chunk);
 
 			if (exited.aborted) exitSignalReceived = true;
-			if (Date.now() >= deadlineMs) break;
+			if (pastDeadline()) break;
 		}
 	} finally {
 		for (const cleanup of cleanups) cleanup();

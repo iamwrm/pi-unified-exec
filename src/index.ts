@@ -59,6 +59,14 @@ import {
 } from "./script-result.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
+import {
+	isNestedToolCall,
+	type PendingProbe,
+	STEER_NESTED_ERROR,
+	STEER_NOTE,
+	SteerGate,
+	steerInterruptEnabled,
+} from "./steer-gate.ts";
 import { buildShellCommand, IS_WINDOWS, resolveDefaultShell, resolveWindowsShell } from "./shell.ts";
 import { MIN_EMPTY_YIELD_TIME_MS, nowUtcIso, parseYieldUntil, resolveEmptyPollYield } from "./time.ts";
 export { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "./time.ts";
@@ -161,6 +169,8 @@ interface ExtensionCtx {
 	pendingSessions: Set<ExecSession>;
 	/** Set on session_shutdown; new exec_commands are rejected. */
 	shuttingDown: boolean;
+	/** Ends attached waits early while a human steer is queued (steer-gate.ts). */
+	steer: SteerGate;
 }
 
 type ExecCommandArgs = {
@@ -224,10 +234,17 @@ function heldOpenNote(session: ExecSession): string | undefined {
 	return session.shellExited && !session.hasExited ? HELD_OPEN_NOTE : undefined;
 }
 
+/** Note for a live session whose wait ended because the human steered. */
+function steeredNote(session: ExecSession): string {
+	const held = heldOpenNote(session);
+	return held ? `${STEER_NOTE} Also: ${held}` : STEER_NOTE;
+}
+
 async function runExecCommand(
 	ctx: ExtensionCtx,
 	args: ExecCommandArgs,
 	signal: AbortSignal | undefined,
+	steerSignal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	cwd: string,
 ): Promise<ResponseShape> {
@@ -376,11 +393,12 @@ async function runExecCommand(
 		// Wait until the yield deadline (or abort/exit). Stream updates meanwhile.
 		const deadlineMs = start + yieldTimeMs;
 		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-		const collected = await session.collect({ deadlineMs, externalAbort: signal });
+		const collected = await session.collect({ deadlineMs, externalAbort: signal, stopSignal: steerSignal });
 		pollStream.stop();
 
 		session.touch();
 		const stillAlive = !session.hasExited;
+		const steered = steerSignal?.aborted === true && signal?.aborted !== true && Date.now() < deadlineMs;
 		const wallSec = (Date.now() - start) / 1000;
 
 		if (stillAlive) {
@@ -406,8 +424,9 @@ async function runExecCommand(
 				extra: {
 					on_exit: args.on_exit,
 					...(wantsWake ? { completion_notification: "armed" as const } : {}),
+					...(steered ? { wait_status: "interrupted_by_steer" as const } : {}),
 					tool_time_utc: nowUtcIso(),
-					note: heldOpenNote(session),
+					note: steered ? steeredNote(session) : heldOpenNote(session),
 				},
 			});
 		}
@@ -442,6 +461,7 @@ async function runWriteStdin(
 	ctx: ExtensionCtx,
 	args: WriteStdinArgs,
 	signal: AbortSignal | undefined,
+	steerSignal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
@@ -475,7 +495,7 @@ async function runWriteStdin(
 		const wait: EmptyWait = parsed
 			? { mode: "absolute", durationMs: parsed.remainingMs, yieldUntil: parsed.normalized }
 			: { mode: "relative", durationMs: resolveEmptyPollYield(args.yield_time_ms) };
-		return runAttachedWait(ctx, session, wait, signal, onUpdate, toolCallId);
+		return runAttachedWait(ctx, session, wait, signal, steerSignal, onUpdate, toolCallId);
 	}
 
 	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
@@ -526,9 +546,10 @@ async function runWriteStdin(
 
 		const deadlineMs = start + yieldTimeMs;
 		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-		const collected = await session.collect({ deadlineMs, externalAbort: signal });
+		const collected = await session.collect({ deadlineMs, externalAbort: signal, stopSignal: steerSignal });
 		pollStream.stop();
 		const wallSec = (Date.now() - start) / 1000;
+		const steered = steerSignal?.aborted === true && signal?.aborted !== true && Date.now() < deadlineMs;
 
 		if (session.hasExited) {
 			const armed = ctx.coordinator.isArmed(session.id);
@@ -575,7 +596,8 @@ async function runWriteStdin(
 			extra: {
 				tool_time_utc: nowUtcIso(),
 				...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
-				note: heldOpenNote(session),
+				...(steered ? { wait_status: "interrupted_by_steer" as const } : {}),
+				note: steered ? steeredNote(session) : heldOpenNote(session),
 			},
 		});
 	} catch (err) {
@@ -609,6 +631,7 @@ async function runAttachedWait(
 	session: ExecSession,
 	wait: EmptyWait,
 	signal: AbortSignal | undefined,
+	steerSignal: AbortSignal | undefined,
 	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
@@ -633,9 +656,11 @@ async function runAttachedWait(
 		let outcome: LongWaitOutcome = await waitForExitOrDeadline({
 			exited: session.exited,
 			externalAbort: signal,
+			steerAbort: steerSignal,
 			durationMs: wait.durationMs,
 		});
-		// Exit wins close races. A cancelled live wait never drains output.
+		// Exit wins close races. A cancelled live wait never drains output; a
+		// steered one drains like a reached deadline (the session stays live).
 		if (session.hasExited) outcome = "exit";
 		const collected = outcome === "cancelled"
 			? { bytes: new Uint8Array(0), omittedBytes: 0 }
@@ -650,10 +675,11 @@ async function runAttachedWait(
 			Object.assign(extra, terminalWaitExtra(wait.mode, armed));
 		} else {
 			extra.wait_status = outcome === "cancelled" ? "cancelled"
+				: outcome === "steered" ? "interrupted_by_steer"
 				: wait.mode === "relative" ? "relative_deadline_reached" : "absolute_deadline_reached";
 			extra.effective_wait_ms = elapsedMs;
 			extra.tool_time_utc = nowUtcIso();
-			extra.note = heldOpenNote(session);
+			extra.note = outcome === "steered" ? steeredNote(session) : heldOpenNote(session);
 			if (armed) {
 				extra.on_exit = "wake";
 				extra.completion_notification = "armed";
@@ -858,6 +884,18 @@ function buildStreamUpdate(
 	};
 }
 
+/**
+ * The steer signal for one exec_command/write_stdin call. A top-level call
+ * made while a steer is already queued returns promptly (its wait sees an
+ * aborted signal). A nested codemode call throws instead: otherwise a script
+ * polling in a loop would spin on instant returns and still hold the steer.
+ */
+function steerSignalFor(ctx: ExtensionCtx, toolCallId: string, probe: PendingProbe): AbortSignal | undefined {
+	if (!ctx.steer.enabled) return undefined;
+	if (ctx.steer.isPending(probe) && isNestedToolCall(toolCallId)) throw new Error(STEER_NESTED_ERROR);
+	return ctx.steer.signal;
+}
+
 function startStreaming(
 	session: ExecSession,
 	onUpdate: AgentToolUpdateCallback<ProcessUpdateDetails> | undefined,
@@ -922,6 +960,7 @@ export default function (pi: ExtensionAPI) {
 		notifiedBashSource: false,
 		pendingSessions: new Set(),
 		shuttingDown: false,
+		steer: new SteerGate({ enabled: steerInterruptEnabled() }),
 	};
 
 	// By default, unified-exec removes pi's built-in `bash` tool so the LLM
@@ -939,12 +978,23 @@ export default function (pi: ExtensionAPI) {
 		ctx.coordinator.handleToolExecutionEnd(event.toolCallId, event.isError === true);
 	});
 	pi.on("agent_settled", async () => {
+		ctx.steer.reset();
 		ctx.coordinator.flushPending();
+	});
+
+	// Steer interrupt: a human steer queued during a long wait ends the wait
+	// early so Pi can deliver it after this tool batch (see steer-gate.ts).
+	pi.on("input", async (event, eventCtx) => {
+		if (event.streamingBehavior === "steer") ctx.steer.onSteerInput(eventCtx);
+	});
+	pi.on("message_start", async (event) => {
+		if (event.message.role === "user") ctx.steer.onUserMessageDelivered();
 	});
 
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx.ui = eventCtx.ui;
 		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
+		ctx.steer.reset();
 		ctx.coordinator.reset(); // never resurrect wakes from a previous session
 		updateRunningSessionsUi(ctx);
 		// Default behavior is to remove the built-in `bash` tool. Only keep it
@@ -977,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
 		// including sessions still inside exec_command's early-exit grace
 		// window (spawned but not yet inserted into the store).
 		ctx.shuttingDown = true;
+		ctx.steer.reset();
 		// Cancel wake timers/listeners first: no stale prompt may ever be
 		// injected into a new or closed session.
 		ctx.coordinator.shutdown();
@@ -1070,6 +1121,7 @@ export default function (pi: ExtensionAPI) {
 			"Use a small yield_time_ms (~500ms) for quick one-shots and the 10s default for most commands; long-running or interactive processes (dev servers, REPLs, ssh, sudo) return a session_id you then drive with write_stdin.",
 			"For a long non-interactive command, start with a short yield to obtain a session_id, then use an empty write_stdin poll with a finite yield_time_ms suited to its expected duration. There is no built-in empty-poll maximum; an operator may configure one. Keep waits short for interactive or indefinite processes. Pi manages cache warming independently.",
 			'on_exit defaults to "none". Prefer polling or human follow-up. Use on_exit: "wake" ONLY when the human explicitly wants auto-resume on unobserved completion — not for indefinite processes (dev servers, watchers). If you armed wake by mistake or the job is wrong/abandoned, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session still kills and suppresses wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
+			'A wait with wait_status "interrupted_by_steer" ended early because the user sent a steering message; the process is still running. Address the steer first and re-poll only if it is still relevant.',
 			"In codemode scripts, exec_command and write_stdin resolve to objects: print r.output with text(r.output) and check r.exit_code / r.session_id, instead of printing the whole result object.",
 		],
 		outputSchema: processScriptResultSchema,
@@ -1105,9 +1157,10 @@ export default function (pi: ExtensionAPI) {
 				),
 			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
+		async execute(toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runExecCommand(ctx, params, signal, onUpdate, eventCtx.cwd);
+			const steerSignal = steerSignalFor(ctx, toolCallId, eventCtx);
+			const shape = await runExecCommand(ctx, params, signal, steerSignal, onUpdate, eventCtx.cwd);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],
@@ -1161,7 +1214,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runWriteStdin(ctx, params, signal, onUpdate, toolCallId);
+			const steerSignal = steerSignalFor(ctx, toolCallId, eventCtx);
+			const shape = await runWriteStdin(ctx, params, signal, steerSignal, onUpdate, toolCallId);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],

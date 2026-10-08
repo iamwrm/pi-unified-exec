@@ -26,12 +26,18 @@ const alive = pid => {
 	try { process.kill(pid, 0); return true; } catch { return false; }
 };
 
-for (const cancel of [false, true]) {
-	test(`TUI: long relative wait ${cancel ? "cancels without killing" : "renders and completes"}`, {
+const titles = {
+	exit: "renders and completes",
+	cancel: "cancels without killing",
+	steer: "returns early on a typed steer without killing",
+};
+for (const mode of ["exit", "cancel", "steer"]) {
+	const cancel = mode !== "exit";
+	test(`TUI: long relative wait ${titles[mode]}`, {
 		skip: !available || process.platform === "win32", timeout: 30_000,
 	}, async () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-exec-tui-"));
-		const name = `exec-wait-${process.pid}-${cancel ? "cancel" : "exit"}`;
+		const name = `exec-wait-${process.pid}-${mode}`;
 		const tmux = (...args) => execFileSync("tmux", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 		const pane = () => tmux("capture-pane", "-p", "-S", "-200", "-t", name);
 		const events = () => readFileSync(join(root, "events.jsonl"), "utf8").split("\n").filter(Boolean).map(JSON.parse);
@@ -60,7 +66,17 @@ setTimeout(() => console.log("job-finished"), ${cancel ? 30_000 : 5000});
 			pid = Number(readFileSync(join(root, "job.pid"), "utf8"));
 			await until(() => pane().includes("900.0s"), "long duration was not rendered");
 			assert.ok(alive(pid));
-			if (cancel) {
+			if (mode === "steer") {
+				tmux("send-keys", "-t", name, "-l", "SMOKE-TEST-1234");
+				tmux("send-keys", "-t", name, "Enter");
+				await until(() => events().some(e => e.type === "wait-end"), "steer did not end the wait");
+				const end = events().find(e => e.type === "wait-end");
+				assert.equal(end.details.wait_status, "interrupted_by_steer");
+				assert.equal(end.details.running, true);
+				assert.ok(alive(pid), "a steer must leave the child alive");
+				await until(() => pane().includes("EXEC_WAIT_OK"), "steered turn not rendered");
+				assert.match(pane(), /steered/);
+			} else if (cancel) {
 				tmux("send-keys", "-t", name, "Escape");
 				await until(() => events().some(e => e.type === "wait-end"), "Esc did not detach");
 				const end = events().find(e => e.type === "wait-end");

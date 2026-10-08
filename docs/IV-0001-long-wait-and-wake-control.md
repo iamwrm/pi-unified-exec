@@ -1,6 +1,6 @@
 # IV-0001 — Long-wait UX, wake control, and agent guidance
 
-**Status:** 0.11.0 source, uncapped relative empty polls; earlier releases documented below
+**Status:** 0.13.0 steer interrupt; 0.11.0 uncapped relative empty polls; earlier releases documented below
 **Root IV:** this document  
 **Related release:** [Changelog.md](../Changelog.md) — 2026-07-22 — 0.7.1 / 0.7.2  
 **Workspace doctrine:** [docs/DC-0001-agentic-workspace.md](./DC-0001-agentic-workspace.md)
@@ -44,6 +44,30 @@ Archive quotas, output-delivery acknowledgement, per-job concurrency changes,
 and registry eviction redesign are not part of this wait-path release. They
 remain separate work; this release does not claim to implement the entire
 from-scratch process-manager proposal.
+
+## Steer interrupt: 0.13.0
+
+Pi's agent loop polls queued steering only after a whole tool batch, so an
+attached wait used to hold a human steer until exit, deadline, or Esc. Esc
+aborts the run; the user wanted the steer delivered instead.
+
+| Decision | Rationale |
+|---|---|
+| Trigger on `input` with `streamingBehavior: "steer"`, confirmed by `ctx.hasPendingMessages()` | The event fires before queueing and a later handler may return `handled`. Extension `sendMessage` steers fire no `input` and are not human attention. |
+| Count pending steers; decrement on `message_start` (role `user`), reset on `agent_settled`/session change | Works for both steering modes; a stale count is dropped when Pi's queue is empty. |
+| One shared signal per pending window | Releases every parallel wait in the batch. |
+| `steered` drains like a deadline, never kills | Output and the session survive; the lease and wake behave as for a non-terminal deadline. Exit wins races. |
+| Absolute `yield_until` waits are interruptible | The human who asked for the long attach is the one steering. |
+| Follow-ups never interrupt | A follow-up waits by definition. |
+| Nested codemode calls throw while pending | A script polling in a loop would otherwise spin on instant returns and still hold the steer until it ends. Nested calls are recognized by Pi's `<parent>/<n>` ids. |
+| Opt-out `PI_UNIFIED_EXEC_STEER_INTERRUPT=0` | Restores the previous behavior. |
+
+Evidence (macOS, Pi 1.0.0, 2026-10-08): `tests/cli-steer.test.ts` drives the
+actual CLI in RPC mode with a scripted provider. An RPC `steer` sent 400 ms into a
+900,000 ms poll ends it with `interrupted_by_steer`. The next request sees the
+steer and the early result; the run completed in about 1.2 s. With the
+opt-out the same test fails after the 30 s job exits. The tmux case types a
+steer during a 900 s wait and sees the `steered` badge with the child alive.
 
 ## Historical intent: 0.7.x
 

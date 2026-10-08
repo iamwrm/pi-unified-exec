@@ -14,7 +14,7 @@
  *     lengthen or shorten an in-progress wait.
  */
 
-export type LongWaitOutcome = "exit" | "deadline" | "cancelled";
+export type LongWaitOutcome = "exit" | "deadline" | "cancelled" | "steered";
 
 /**
  * Max single setTimeout arm. Values above ~2^31-1 overflow and fire early;
@@ -27,6 +27,8 @@ export interface LongWaitInputs {
 	exited: AbortSignal;
 	/** External cancellation (Esc / tool-call abort). Never kills the child. */
 	externalAbort?: AbortSignal;
+	/** A human steer is queued (src/steer-gate.ts). Ends the wait like an early deadline. */
+	steerAbort?: AbortSignal;
 	/** Validated duration in ms; absolute callers compute it once from wall time. */
 	durationMs: number;
 	/** Injectable monotonic clock (default: performance.now). Test hook. */
@@ -37,12 +39,13 @@ export interface LongWaitInputs {
 }
 
 /**
- * Wait until the process exits, the tool call is cancelled, or the monotonic
- * deadline arrives — whichever happens first. All timers and listeners are
- * released on every exit path.
+ * Wait until the process exits, the tool call is cancelled, a human steer is
+ * queued, or the monotonic deadline arrives — whichever happens first. Exit
+ * wins over the other outcomes when both are already signalled. All timers and
+ * listeners are released on every exit path.
  */
 export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<LongWaitOutcome> {
-	const { exited, externalAbort, durationMs } = inputs;
+	const { exited, externalAbort, steerAbort, durationMs } = inputs;
 	const monotonicNow = inputs.monotonicNow ?? (() => performance.now());
 	const setTimeoutFn = inputs.setTimeoutFn ?? ((cb: () => void, ms: number) => setTimeout(cb, ms));
 	const clearTimeoutFn = inputs.clearTimeoutFn ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
@@ -52,6 +55,7 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 	}
 	if (exited.aborted) return "exit";
 	if (externalAbort?.aborted) return "cancelled";
+	if (steerAbort?.aborted) return "steered";
 	if (durationMs <= 0) return "deadline";
 
 	// Subtract elapsed time rather than adding a possibly enormous duration
@@ -62,18 +66,17 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 
 	const cleanups: Array<() => void> = [];
 	try {
-		const exitP = new Promise<LongWaitOutcome>((resolve) => {
-			const onAbort = () => resolve("exit");
-			exited.addEventListener("abort", onAbort, { once: true });
-			cleanups.push(() => exited.removeEventListener("abort", onAbort));
-		});
-		const cancelP: Promise<LongWaitOutcome> = externalAbort
-			? new Promise((resolve) => {
-					const onAbort = () => resolve("cancelled");
-					externalAbort.addEventListener("abort", onAbort, { once: true });
-					cleanups.push(() => externalAbort.removeEventListener("abort", onAbort));
-				})
-			: new Promise<never>(() => {});
+		const onSignal = (signal: AbortSignal | undefined, outcome: LongWaitOutcome): Promise<LongWaitOutcome> =>
+			signal
+				? new Promise((resolve) => {
+						const onAbort = () => resolve(outcome);
+						signal.addEventListener("abort", onAbort, { once: true });
+						cleanups.push(() => signal.removeEventListener("abort", onAbort));
+					})
+				: new Promise<never>(() => {});
+		const exitP = onSignal(exited, "exit");
+		const cancelP = onSignal(externalAbort, "cancelled");
+		const steerP = onSignal(steerAbort, "steered");
 
 		// Single timer, re-armed only if it fires before the monotonic deadline
 		// (coarse timer granularity, or multi-day waits chunked below the
@@ -93,8 +96,8 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 			});
 
 		for (;;) {
-			const which = await Promise.race([exitP, cancelP, armTimer().then(() => "timer" as const)]);
-			if (which === "exit" || which === "cancelled") return which;
+			const which = await Promise.race([exitP, cancelP, steerP, armTimer().then(() => "timer" as const)]);
+			if (which !== "timer") return exited.aborted ? "exit" : which;
 			// Timer fired: trust only the monotonic clock.
 			if (remainingMs() <= 0) return "deadline";
 			if (timerHandle !== undefined) {

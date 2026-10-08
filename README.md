@@ -37,8 +37,8 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   and input-bearing `write_stdin` calls yield within 30 seconds. Empty polls
   default to five seconds and accept finite relative durations without a
   built-in maximum. Human-requested `yield_until` waits use an absolute UTC
-  deadline. Both return on exit, cancellation, or deadline; cancellation
-  leaves the process alive. Multi-day waits re-arm timers safely and retain
+  deadline. Both return on exit, cancellation, deadline, or a human steering
+  message; cancellation and steering leave the process alive. Multi-day waits re-arm timers safely and retain
   bounded output instead of accumulating it inside the waiting call.
 - **Completion can resume the agent (opt-in).** `exec_command(on_exit: "wake")`
   (default is `"none"`) delivers exactly one follow-up model prompt (bounded
@@ -187,6 +187,27 @@ Drives or polls an existing session.
    observed directly by a tool result consumes the wake; a deadline or
    cancellation leaves the wake armed until disarmed or delivered.
 
+#### Steering during a wait
+
+Pi delivers a queued steering message only after the whole tool batch
+finishes, so a long attached poll used to hold a steer until the wait ended.
+Since 0.13.0, a human steer (Enter while the agent runs, or RPC `steer`)
+ends every live wait early: empty relative and absolute polls, and the
+≤30-second yields of `exec_command` and input-bearing `write_stdin`.
+
+- The call drains output gathered so far, like a reached deadline, and returns
+  `wait_status: interrupted_by_steer` with the live `session_id` and a note.
+  The process keeps running and an armed wake stays armed. Exit still wins a
+  same-instant race.
+- A call started while a steer is already queued returns immediately.
+- Nested codemode calls (`ctx.executeTool()`) instead fail with an error while
+  a steer is queued. A polling script then ends, rather than spinning on
+  instant returns while it holds the steer.
+- Only human `input` steers count; follow-ups and extension `sendMessage`
+  steers do not interrupt. The steer is confirmed against Pi's queue, so input
+  that another extension handled is ignored.
+- `PI_UNIFIED_EXEC_STEER_INTERRUPT=0` restores the previous behavior.
+
 **Never** use `yield_until` for REPLs, `sudo`, `ssh`, password prompts,
 dev servers, file watchers, debuggers, or any indefinite/interactive
 session — it is only for finite commands that exit on their own.
@@ -213,6 +234,7 @@ still unbounded on disk; archive quotas and bounded log-write backlogs remain
 
 | Env var | Default | Notes |
 |---|---|---|
+| `PI_UNIFIED_EXEC_STEER_INTERRUPT` | on | `0` disables ending waits early on a human steer. |
 | `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | unset, no cap | Optional limit for empty relative `write_stdin` polls. May exceed 290 seconds. Positive values below `5_000` become `5_000`; fractions round down. Invalid, non-positive, non-finite, or unsafe values fail the relative poll instead of silently removing protection. Does not change human-explicit absolute waits. |
 
 To retain the old limit, explicitly set `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS=290000`.
@@ -478,7 +500,8 @@ $ for i in {1..12}; do echo round $i; sleep 0.5; done (yield 2.5s · cwd: ~/proj
 
 **Absolute-wait footer** (while still attached) shows remaining time such as
 `2h40m later` (ISO deadline stays in tool details for the model). Cancelled
-waits mark `cancelled`; armed wakes may show `wake armed`.
+waits mark `cancelled`, steer-interrupted waits mark `steered`; armed wakes
+may show `wake armed`.
 
 **set_on_exit:**
 ```
@@ -572,7 +595,10 @@ PREVIEW_LINES                = 5       (visual TUI lines before app.tools.expand
   the session. The next turn can still drive it. For either empty-poll form the
   cancelled call reports `wait_status: cancelled`, does not drain buffered
   output, and leaves an armed `on_exit: "wake"` eligible.
-- **Empty-poll races**: if exit, cancellation, and deadline land almost
+- **Human steer**: ends the wait early and drains buffered output, unlike
+  Esc; reports `wait_status: interrupted_by_steer` and keeps the process and
+  any armed wake. See [Steering during a wait](#steering-during-a-wait).
+- **Empty-poll races**: if exit, cancellation, steer, and deadline land almost
   simultaneously, actual process exit wins whenever the session is already
   terminal when the result is assembled.
 - **Session shutdown**: all live sessions are terminated with SIGTERM; after a
@@ -596,6 +622,7 @@ src/
 ├── head-tail-buffer.ts   # direct port of codex's HeadTailBuffer
 ├── collect.ts            # collectOutputUntilDeadline
 ├── long-wait.ts          # shared event-driven empty-poll wait + rate-limited streaming
+├── steer-gate.ts         # human steer → shared abort signal that ends waits early
 ├── time.ts               # relative duration/operator limit + strict UTC deadline parsing
 ├── format-time.ts        # shared elapsed / remaining human labels
 ├── completion.ts         # CompletionCoordinator: on_exit "wake" scheduling (exactly-once)
@@ -736,7 +763,9 @@ Tests cover yield_until timestamp validation (strict RFC 3339 UTC subset,
 impossible-date rejection, far-future acceptance, `tool_time_utc` on errors),
 event-driven long-wait behavior (monotonic re-arm, multi-day timer chunking,
 cancellation, timer/listener cleanup, rate-limited streaming with no idle
-heartbeat), the CompletionCoordinator (exactly-once invariant, observation
+heartbeat), steer interrupts (gate confirmation/delivery, every wait form,
+parallel and nested codemode calls, actual-CLI RPC steer and a typed tmux
+steer), the CompletionCoordinator (exactly-once invariant, observation
 leases, `setOnExit` disarm/re-arm including tombstones, kill/eviction/shutdown
 suppression, batching, bounded sanitized wake content), wake + yield_until +
 `set_on_exit` + `wake_armed` listing integration through the real tools, plus

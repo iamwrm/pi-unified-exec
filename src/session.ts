@@ -282,7 +282,12 @@ export class ExecSession {
 	 * Thin wrapper over collectOutputUntilDeadline so call sites don't repeat
 	 * the buffer/notify/gate plumbing.
 	 */
-	collect(opts: { deadlineMs: number; externalAbort?: AbortSignal; postExitCloseWaitMs?: number }): Promise<CollectResult> {
+	collect(opts: {
+		deadlineMs: number;
+		externalAbort?: AbortSignal;
+		stopSignal?: AbortSignal;
+		postExitCloseWaitMs?: number;
+	}): Promise<CollectResult> {
 		return collectOutputUntilDeadline({
 			buffer: this.outputBuffer,
 			outputNotify: this.outputNotify,
@@ -290,6 +295,7 @@ export class ExecSession {
 			exited: this.exited,
 			deadlineMs: opts.deadlineMs,
 			externalAbort: opts.externalAbort,
+			stopSignal: opts.stopSignal,
 			postExitCloseWaitMs: opts.postExitCloseWaitMs,
 		});
 	}
