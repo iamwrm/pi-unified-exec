@@ -6,7 +6,7 @@
 
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -40,7 +40,8 @@ test("actual Pi: an RPC steer ends a long poll and reaches the next turn", { tim
 		writeFileSync(join(root, "agent", "settings.json"), JSON.stringify({
 			defaultProjectTrust: "always", compaction: { enabled: false }, cacheWarming: "off",
 		}));
-		writeFileSync(join(root, "job.cjs"), 'console.log("job-started"); setTimeout(() => {}, 30_000);\n');
+		writeFileSync(join(root, "job.cjs"),
+			'require("node:fs").writeFileSync("job.pid", String(process.pid)); console.log("job-started"); setTimeout(() => {}, 30_000);\n');
 		const send = (cmd: object) => child.stdin.write(`${JSON.stringify(cmd)}\n`);
 		let steerSentAt = 0;
 		let pollEnd: any;
@@ -82,7 +83,25 @@ test("actual Pi: an RPC steer ends a long poll and reaches the next turn", { tim
 		assert.ok(pollEndedAt - steerSentAt < 3000, `poll ended ${pollEndedAt - steerSentAt} ms after the steer`);
 		assert.deepEqual(assistantTexts.filter((t) => /^STEER_/.test(t)), ["STEER_SEEN"]);
 	} finally {
-		child.kill("SIGTERM");
-		rmSync(root, { recursive: true, force: true });
+		// Best-effort cleanup that never masks the test result. Closing stdin
+		// lets Pi run session_shutdown (which terminates the job); Windows
+		// cannot remove a directory that a live process still uses as cwd.
+		const exited = new Promise<void>((resolve) => {
+			if (child.exitCode !== null || child.signalCode !== null) return resolve();
+			child.once("exit", () => resolve());
+		});
+		child.stdin.end();
+		await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+		if (child.exitCode === null && child.signalCode === null) {
+			child.kill("SIGKILL");
+			await Promise.race([exited, new Promise((r) => setTimeout(r, 2000))]);
+		}
+		const pidFile = join(root, "job.pid");
+		if (existsSync(pidFile)) {
+			try { process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL"); } catch {}
+		}
+		try {
+			rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+		} catch {}
 	}
 });

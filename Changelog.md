@@ -4,6 +4,10 @@ All notable changes to this project. **Newest entries go on top.**
 
 ## Unreleased
 
+- Test-only: `tests/cli-steer.test.ts` cleanup no longer masks the result on Windows. It closes Pi's stdin so session shutdown ends the job, kills the job by PID as a fallback, and removes the temporary directory with retries. The 0.13.0 Windows CI failure was `EPERM` from removing that directory while processes still used it.
+
+## 0.13.0 - 2026-10-08
+
 - 0.13.0: a human steering message ends attached waits early. Pi delivers queued steers only after the whole tool batch finishes, so a 900-second `write_stdin` poll held a steer for the full wait. New `src/steer-gate.ts` turns Pi's `input` event (`streamingBehavior: "steer"`), confirmed against `ctx.hasPendingMessages()`, into one shared abort signal. It resets when Pi delivers the message (`message_start`, role `user`) or the run settles.
 - Relative and absolute empty polls (new `steered` outcome in `waitForExitOrDeadline`) and the ≤30-second yields of `exec_command` and input-bearing `write_stdin` (new `stopSignal` early deadline in `collect`) return `wait_status: interrupted_by_steer` with output drained, the live `session_id` and a steer note. Exit still wins; the process, observation lease and armed wakes behave as for a reached deadline. Esc is unchanged.
 - A call started while a steer is queued returns immediately. Nested codemode calls throw instead, so polling scripts end rather than spin. Follow-ups and extension `sendMessage` steers never interrupt. Opt out with `PI_UNIFIED_EXEC_STEER_INTERRUPT=0`. TUI shows a `steered` badge; prompt guidance tells the model to address the steer before re-polling.
