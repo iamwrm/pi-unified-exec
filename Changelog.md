@@ -2,8 +2,9 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
-## Unreleased
+## 0.13.1 - 2026-10-08
 
+- Sharpen the two model-facing steer texts. `STEER_NOTE` now says the process was **not interrupted** (the `interrupted_by_steer` enum name alone can read as if the child was signaled), that output keeps buffering so the next poll returns everything produced since, and that re-attaching with `on_exit: "wake"` is the no-polling alternative. `STEER_NESTED_ERROR` now explicitly forbids retrying the stopped script call — end the polling loop and read the steer — and adds the same buffering reassurance. Both keep the `steering message` phrasing the tests match on.
 - Test-only: `tests/cli-steer.test.ts` cleanup no longer masks the result on Windows. It closes Pi's stdin so session shutdown ends the job, kills the job by PID as a fallback, and removes the temporary directory with retries. The 0.13.0 Windows CI failure was `EPERM` from removing that directory while processes still used it.
 
 ## 0.13.0 - 2026-10-08

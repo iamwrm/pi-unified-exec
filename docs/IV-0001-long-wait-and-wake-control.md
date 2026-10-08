@@ -1,6 +1,6 @@
 # IV-0001 — Long-wait UX, wake control, and agent guidance
 
-**Status:** 0.13.0 steer interrupt; 0.11.0 uncapped relative empty polls; earlier releases documented below
+**Status:** 0.13.1 steer-note wording; 0.13.0 steer interrupt; 0.11.0 uncapped relative empty polls; earlier releases documented below
 **Root IV:** this document  
 **Related release:** [Changelog.md](../Changelog.md) — 2026-07-22 — 0.7.1 / 0.7.2  
 **Workspace doctrine:** [docs/DC-0001-agentic-workspace.md](./DC-0001-agentic-workspace.md)

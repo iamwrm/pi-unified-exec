@@ -25,12 +25,16 @@ export const STEER_INTERRUPT_ENV = "PI_UNIFIED_EXEC_STEER_INTERRUPT";
 /** Shown to the model when a wait returns because the human steered. */
 export const STEER_NOTE =
 	"returned early: the user sent a steering message, which Pi delivers next. " +
-	"The process is still running; read the steer first, then re-poll this session_id only if it is still relevant.";
+	"The process was not interrupted — it is still running and still buffering " +
+	"output, so the next poll returns everything produced since. Read the steer " +
+	"first, then re-poll this session_id only if it is still relevant (optionally " +
+	"with on_exit: \"wake\" to be woken when it exits).";
 
 /** Thrown for nested (codemode) calls while a steer is pending, so a polling script ends. */
 export const STEER_NESTED_ERROR =
 	"unified-exec: the user sent a steering message; this script call was stopped so Pi can deliver it. " +
-	"Running sessions were not killed — re-poll them after reading the steer if still relevant.";
+	"Do not retry it — end the polling loop and read the steer. Sessions were not killed and keep " +
+	"buffering output; re-poll those still relevant afterwards.";
 
 /** The subset of Pi's ExtensionContext the gate consults. */
 export interface PendingProbe {
